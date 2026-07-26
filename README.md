@@ -6,7 +6,9 @@ Todo corre en local, sin GPU obligatoria, pensado para una laptop doméstica (AM
 
 ## Estado actual
 
-Proyecto en etapa temprana. El servidor Axum y el endpoint de subida ya funcionan end-to-end (streaming a disco, no se carga el archivo completo en RAM), pero el pipeline de procesamiento (`src/audio_pipeline/`) es todavía un esqueleto: los métodos de `StreamingDecoder`, `WhisperRunner`, `CheckpointManager` y `JsonlWriter::append` son `todo!()` sin implementar. Ver [`docs/TODO.md`](docs/TODO.md) para el detalle de qué falta y en qué orden.
+Fase 1 (upload) y Fase 2 (Whisper/Symphonia) funcionan de punta a punta: subida validada por magic bytes → job con directorio propio → decode + resample 16kHz + chunking con overlap/crossfade → transcripción con whisper-rs → persistencia JSONL, probado contra audio real. Fase 3 (checkpoint/crash-recovery real) y Fase 4 (embeddings + Qdrant) siguen pendientes. Ver [`docs/TODO.md`](docs/TODO.md) para el detalle de qué falta.
+
+**Nota importante sobre formatos reales**: las grabaciones de teléfono de este proyecto (tanto `.mp3` como `.m4a`) resultaron ser, en la práctica, **AMR-NB dentro de un contenedor MP4/3GP** — un códec de voz de banda angosta (8kHz) que Symphonia (la librería principal, pura Rust) no sabe decodificar. El pipeline detecta esto automáticamente y cae a invocar `ffmpeg`/`ffprobe` como subproceso para esos archivos (streaming, sin bufferear el audio completo en memoria). **Esto requiere tener `ffmpeg` y `ffprobe` instalados y en el `PATH`** — es la única dependencia externa al binario de Rust en todo el proyecto. Ver `CLAUDE.local.md` para el detalle técnico completo.
 
 ## Flujo (diseño objetivo)
 
@@ -20,8 +22,9 @@ POST /api/upload-audio   (streaming a SSD, valida mp3/mp4)
 Fase 1 — Upload          crea Job ID + metadata, encola
         │
         ▼
-Fase 2 — Whisper         chunks de 30s, resample a 16kHz mono (rubato),
-   (spawn_blocking)      whisper-rs CPU-only, libera memoria al terminar
+Fase 2 — Whisper         Symphonia (o ffmpeg como fallback), resample a
+   (spawn_blocking)      16kHz mono (rubato), chunks de 30s + overlap,
+                          whisper-rs CPU-only, libera memoria al terminar
         │
         ▼
 Fase 3 — Embeddings      Ollama (carga → embed → descarga modelo)
@@ -45,8 +48,11 @@ Cada fase libera sus recursos antes de que empiece la siguiente — nunca hay do
 | ollama-rs | 0.3.4 |
 | serde / serde_json | 1.0.228 / 1.0.150 |
 | uuid | 1.23.1 (v4) |
+| rubato | 0.15 (resampler sinc anti-aliasing) |
 
 Rust edition 2024. Ver `Cargo.toml` para el lockfile completo.
+
+**Dependencia externa (no-Rust)**: `ffmpeg` y `ffprobe` deben estar instalados y en el `PATH` — se usan como fallback de decode cuando Symphonia no reconoce el códec del archivo (ver nota sobre AMR-NB en "Estado actual").
 
 ## Estructura
 

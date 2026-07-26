@@ -15,26 +15,35 @@ El pipeline nunca mantiene dos cargas pesadas (Whisper, Ollama) residentes en me
 3. Persiste su resultado de forma incremental (JSONL, checkpoints).
 4. Libera sus recursos antes de que arranque la fase siguiente.
 
-## Fase 1 — Upload (`handlers/audio_handler.rs`)
+## Fase 1 — Upload (`handlers/audio_handler.rs`, `audio_pipeline/job.rs`) — implementado
 
 - Recibe `multipart/form-data` en `POST /api/upload-audio`.
-- Escribe el archivo a disco incrementalmente (`campo.chunk().await` + `write_all`), nunca junta el archivo completo en un `Vec<u8>`.
-- **Pendiente**: validar que el archivo sea mp3 o mp4 *antes* de escribir a disco (o al menos antes de encolar la Fase 2) — hoy el handler acepta cualquier `file_name` sin chequear extensión ni magic bytes.
+- **Validación por magic bytes, no por extensión declarada**: se lee el primer chunk del stream *antes* de crear ningún archivo o directorio, y se detecta el contenedor real (`ID3`/frame sync MPEG → mp3; caja `ftyp` ISO-BMFF → mp4, cubre también `.m4a`). Cualquier otro contenido se rechaza con `400` sin tocar disco.
+- `audio_pipeline::job::create_job(extension)` genera un `job_id` (UUID v4) y una carpeta propia `./jobs/{job_id}/` con `audio_path`/`transcript_path`/`checkpoint_path` fijos y un `job.json` con la metadata inicial (`status: Pending`).
+- El nombre de archivo que manda el cliente **nunca se usa como parte de una ruta de disco** — solo se usa para logging. Esto elimina path traversal por construcción en vez de "sanearlo".
 - Tras guardar el archivo, adquiere un permiso de `transcription_semaphore` (1 solo permit — ver `state.rs`) y lanza el pipeline en background con `tokio::spawn` + `tokio::task::spawn_blocking` para la parte CPU-bound.
-- Genera un Job ID y metadata (`audio_pipeline::job::create_job`) — hoy es un `todo!()`.
+- La respuesta `202` incluye el `job_id` (JSON) para que el cliente pueda consultar el resultado más adelante.
 
-## Fase 2 — Whisper (`audio_pipeline/decoder.rs`, `whisper_runner.rs`, `pipeline.rs`)
+## Fase 2 — Whisper (`audio_pipeline/decoder.rs`, `whisper_runner.rs`, `pipeline.rs`) — implementado
 
-- **Decode + resample** (`StreamingDecoder`, hoy sin implementar): Symphonia decodifica el contenedor (mp3/mp4) pero **no resamplea** — el pipeline debe resamplear explícitamente a PCM mono 16kHz con un resampler basado en sinc con filtro anti-aliasing (`rubato`), nunca decimación/interpolación lineal, para no aliasar frecuencias por encima de la nueva Nyquist (8kHz) sobre el espectro de voz.
-- **Chunking**: ventanas de 30s, tamaño múltiplo del hop size de Whisper (10ms hop / 25ms window), con overlap de 2-3s y crossfade (Hann/Tukey) en los bordes para evitar cortar palabras o duplicarlas.
-- **Inferencia** (`WhisperRunner`, hoy sin implementar): whisper-rs 0.16.0, modelo GGML cuantizado `ggml-base-tdrz-q5_1.bin`, `FullParams` con `SamplingStrategy::Greedy`. Siempre dentro de `tokio::task::spawn_blocking` — nunca `tokio::spawn` directo, porque es trabajo CPU-bound y bloquearía el runtime async.
-- **Turn-detection (tdrz)**: el modelo es *tinydiarize*, pero hoy la config no llama `set_tdrz_enable(true)`, así que el campo `speaker` del payload nunca se puebla. Si se activa: tinydiarize da *turn segmentation* (cambios de speaker dentro de una llamada a `full()`), no clustering de identidad — hace falta un contador de turno propio que viva en el estado del job, no en el scope de cada chunk. Los turnos detectados en la ventana de overlap entre chunks deben dedupearse (una sola zona de decisión, no dos independientes) para no contar un mismo cambio de speaker dos veces en la costura.
+- **Decode + resample** (`StreamingDecoder`): intenta demuxear/decodificar con Symphonia primero (puro Rust). Se queda únicamente con el track de audio del contenedor — nunca instancia un decoder de video para un mp4. Si Symphonia no reconoce el códec (ver nota AMR-NB más abajo), cae a un fallback que invoca `ffmpeg` como subproceso y lee PCM crudo de su stdout de forma incremental (bloques de 64KB, nunca el archivo completo en memoria). En ambos casos, el audio decodificado (downmixed a mono) pasa por el mismo resampler `rubato` (`SincFixedIn`, interpolación Cubic, ventana BlackmanHarris2) hacia PCM mono 16kHz — sinc con filtro anti-aliasing, nunca decimación/interpolación lineal.
+- **Nota real sobre el sample rate de entrada**: el supuesto original de "el input viene a 44.1/48kHz" no se cumple para el dataset real de este proyecto — ver "Códec real de las grabaciones" abajo. El resampler calcula el ratio dinámicamente a partir del sample rate reportado por el decoder/`ffprobe`, así que funciona igual de bien haciendo upsampling que downsampling.
+- **Chunking**: ventanas de 30s (480,000 samples @ 16kHz, múltiplo exacto del hop de Whisper), con overlap de 2s y crossfade (Hann) aplicado únicamente en los bordes *internos* entre chunks consecutivos — nunca en el primer inicio ni el último final del audio completo.
+- **Inferencia** (`WhisperRunner`): whisper-rs 0.16.0, modelo GGML cuantizado `ggml-small-q5_1.bin` (ver nota de cambio de modelo abajo), `FullParams` con `SamplingStrategy::Greedy` (config exacta fijada en `CLAUDE.local.md`, sin `tdrz`). Mantiene un único `WhisperState` vivo durante todo el job (no uno por chunk), para que `set_no_context(false)` aporte continuidad de contexto real entre los chunks de una reunión larga. Siempre corre dentro de `tokio::task::spawn_blocking` (heredado desde `audio_handler.rs`, que ya envuelve todo `run_pipeline`) — nunca `tokio::spawn` directo.
+- **Cambio de modelo**: el modelo originalmente previsto, `ggml-base-tdrz-q5_1.bin` (*tinydiarize*, turn-detection de speaker), no se consiguió. Se usa `ggml-small-q5_1.bin` — mejor accuracy de transcripción (prioridad #1 del proyecto) a costa de más RAM/CPU por chunk, pero sin variante tdrz. La detección de turnos de speaker queda fuera de alcance por ahora (no es una regresión: tdrz tampoco estaba activado antes). Ver `CLAUDE.local.md` para el detalle de costo/beneficio de tdrz, guardado como referencia por si se retoma con otro modelo.
 - **Liberación de memoria**: el runner de Whisper se dropea al terminar la fase — no queda residente esperando la siguiente subida.
 
-## Fase 3 — Persistencia incremental (`checkpoint.rs`, `jsonl_writer.rs`)
+### Códec real de las grabaciones — AMR-NB y fallback a ffmpeg
 
-- `JsonlWriter` escribe una línea JSON por chunk (`{"chunk":1,"text":"..."}`) — nunca acumula la transcripción completa en memoria antes de escribir.
-- `CheckpointManager` persiste `(last_chunk, processed_seconds)` para poder retomar un audio de 5h si el proceso crashea a la mitad, sin re-transcribir desde el principio.
+Se verificó con `ffprobe` que las grabaciones reales de `sample_Media/` (tanto `.mp3` como `.m4a`) son en realidad **AMR-NB a 8kHz mono dentro de un contenedor MP4/3GP**, sin importar la extensión declarada. Symphonia (puro Rust) no implementa un decoder de AMR-NB. Por eso `StreamingDecoder` prueba Symphonia primero (sigue siendo el camino principal para cualquier mp3/mp4/AAC bien formado) y cae a `ffmpeg`/`ffprobe` como subproceso únicamente cuando Symphonia no encuentra un track de audio decodificable.
+
+Esto introduce la única dependencia externa al binario de Rust del proyecto: `ffmpeg` y `ffprobe` deben estar en el `PATH`. Sigue siendo 100% local/offline (no hay llamadas de red), solo deja de ser puro-Rust para el paso de decode en los archivos que lo requieren. AMR-NB además es un códec de voz de banda angosta (~4kHz de ancho útil) — es un techo de calidad inherente a la grabación de origen, no algo que el resampling o el tuning de Whisper puedan compensar.
+
+## Fase 3 — Persistencia incremental (`checkpoint.rs`, `jsonl_writer.rs`) — parcialmente implementado
+
+- `JsonlWriter::append` escribe una línea JSON por chunk (`{"chunk":1,"start":0.0,"end":30.0,"text":"..."}`) y flushea inmediatamente — nunca acumula la transcripción completa en memoria.
+- `CheckpointManager` persiste `(last_chunk, processed_seconds)` en disco (`load` devuelve el default si el archivo no existe todavía, es decir la primera corrida de un job).
+- **Pendiente**: el flujo de recuperación ante crash real todavía no se probó end-to-end (matar el proceso a mitad de un audio largo y confirmar que retoma sin re-transcribir desde el principio). Además, tras un `seek_seconds` real el contador `chunk_index` del decoder se reinicia en 0 — los timestamps `start_sec`/`end_sec` quedan correctos porque se derivan del segundo de reanudación, pero la numeración de chunk no continúa la del job original. Ver `docs/TODO.md`.
 
 ## Fase 4 — Embeddings + Qdrant (no implementado aún)
 
