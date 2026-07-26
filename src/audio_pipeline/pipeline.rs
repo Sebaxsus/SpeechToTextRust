@@ -15,7 +15,7 @@ pub fn run_pipeline(metadata: JobMetadata) -> anyhow::Result<()> {
 
     decoder.seek_seconds(cp.processed_seconds)?;
 
-    let runner = WhisperRunner::new("models/ggml-base-tdrz-q5_1.bin")?;
+    let mut runner = WhisperRunner::new("models/ggml-small-q5_1.bin")?;
 
     while let Some(chunk) = decoder.next_chunk()? {
         let text = runner.transcribe_chunk(&chunk.samples)?;

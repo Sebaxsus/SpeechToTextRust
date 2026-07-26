@@ -16,6 +16,7 @@ ollama-rs = "0.3.4"
 uuid = { version = "1.23.1", features = ["v4"] }
 whisper-rs = "0.16.0"
 symphonia = { version = "0.6.0", features = ["all"] }
+rubato = "0.15"
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }

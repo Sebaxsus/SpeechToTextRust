@@ -2,33 +2,37 @@
 
 Pendientes detectados en el estado actual del código, priorizados de forma aproximada (bloqueantes primero). Ver `docs/Arquitechture.md` para el contexto de cada fase y `CLAUDE.local.md` para los detalles de parámetros/decisiones ya fijadas.
 
-## Bloqueante — Fase 1 (Upload)
+## Completado — Fase 1 (Upload)
 
-- [ ] Validar formato de archivo (mp3/mp4 únicamente) en `handlers/audio_handler.rs` **antes** de escribir a disco, o al menos antes de encolar la Fase 2. Hoy no hay ningún chequeo de extensión ni magic bytes — se acepta y se escribe cualquier archivo.
-- [ ] Implementar `audio_pipeline::job::create_job` (hoy `todo!()`): generar Job ID, rutas de `audio_path` / `transcript_path` / `checkpoint_path`, persistir metadata inicial.
-- [ ] Sanear `nombre_archivo` en `audio_handler.rs` antes de usarlo como parte de una ruta de disco (`format!("./uploads/{}", nombre_archivo)`) — hoy viene directo del `file_name()` del multipart sin validar path traversal (`../`) ni caracteres inválidos.
+- [x] Validar formato de archivo (mp3/mp4, incluyendo `.m4a` como mp4) por magic bytes, antes de escribir a disco.
+- [x] Implementar `audio_pipeline::job::create_job`: Job ID, carpeta propia `./jobs/{job_id}/`, rutas fijas, `job.json` con metadata inicial.
+- [x] Eliminar el riesgo de path traversal: el nombre de archivo del cliente ya no se usa como parte de ninguna ruta de disco (en vez de "sanearlo", se dejó de usar).
 
-## Bloqueante — Fase 2 (Whisper)
+## Completado — Fase 2 (Whisper/Symphonia)
 
-- [ ] Implementar `StreamingDecoder` (`audio_pipeline/decoder.rs`, hoy `todo!()` en los 3 métodos): demux con Symphonia, extraer solo el track de audio (nunca decodificar video en los mp4), y **resamplear a PCM mono 16kHz con `rubato`** (filtro anti-aliasing, sinc-based) — obligatorio, no opcional, ver `CLAUDE.local.md`.
-- [ ] Chunking de 30s con overlap de 2-3s y crossfade (Hann/Tukey) en los bordes, respetando que el tamaño de chunk sea múltiplo del hop size de Whisper.
-- [ ] Implementar `WhisperRunner` (`audio_pipeline/whisper_runner.rs`, hoy `todo!()`): cargar el modelo GGML, aplicar el `FullParams` ya definido en `CLAUDE.local.md`, ejecutar siempre dentro de `tokio::task::spawn_blocking`.
-- [ ] Confirmar que la llamada real a Whisper ocurre en `spawn_blocking` y no en el `tokio::spawn` que ya envuelve el job en `audio_handler.rs` (hoy ese `spawn_blocking` interno existe en `pipeline.rs` vía `run_pipeline`, pero falta la implementación real que lo justifique).
+- [x] Implementar `StreamingDecoder`: demux con Symphonia, solo track de audio (nunca video), resample a PCM mono 16kHz con `rubato` (sinc, anti-aliasing).
+- [x] Chunking de 30s con overlap de 2s y crossfade (Hann) en los bordes internos, respetando múltiplos del hop size de Whisper.
+- [x] Implementar `WhisperRunner`: carga el modelo GGML, aplica el `FullParams` de `CLAUDE.local.md`, mantiene un único `WhisperState` por job para continuidad de contexto entre chunks.
+- [x] Confirmado: la llamada real a Whisper corre dentro de `spawn_blocking` (heredado desde `audio_handler.rs`).
+- [x] Fallback a `ffmpeg`/`ffprobe` para códecs que Symphonia no soporta (AMR-NB, el códec real de las grabaciones de `sample_Media/` — ver `CLAUDE.local.md`).
 
 ## Importante — Precisión / tdrz
 
-- [ ] Decidir si se activa `set_tdrz_enable(true)` (hoy no se llama). Si se activa:
+El modelo cambió de `ggml-base-tdrz-q5_1.bin` (no se consiguió) a `ggml-small-q5_1.bin`, que no tiene variante tdrz — todo este bloque queda en espera hasta que se retome con un modelo tdrz.
+
+- [ ] Si se consigue un modelo tdrz en el futuro: decidir si se activa `set_tdrz_enable(true)`. Si se activa:
   - [ ] Mantener un contador de `speaker_id` / timestamp del último turno confirmado en el estado del *job* (no en el scope de cada llamada a `full()`).
   - [ ] Implementar dedupe de turnos en la ventana de overlap entre chunks (umbral mínimo ~0.5-1s entre turnos, tratar el overlap como una sola zona de decisión).
-  - [ ] Probar calidad empíricamente en español — la combinación `base` + `set_language("es")` + tdrz no está validada por upstream (tdrz solo está probado oficialmente sobre `small.en-tdrz`).
+  - [ ] Probar calidad empíricamente en español — tdrz solo está validado oficialmente sobre `small.en-tdrz` (inglés).
 - [ ] Evaluar `set_suppress_nst(true)` para reducir alucinaciones en silencios, complementando `no_speech_thold`.
 - [ ] Evaluar VAD real (`set_vad_model_path` / `enable_vad`) para saltar tramos de silencio en audios de 5h y bajar CPU, sin perder tramos con voz baja.
 
 ## Fase 3 — Persistencia
 
-- [ ] Implementar `JsonlWriter::append` (hoy `todo!()`): escribir una línea JSON + flush por llamada, sin acumular el transcript completo en memoria.
-- [ ] Implementar `CheckpointManager` (`new`/`load`/`save`, hoy `todo!()` los 3): persistencia de `(last_chunk, processed_seconds)` para recuperación ante crash en audios largos.
+- [x] Implementar `JsonlWriter::append`: una línea JSON + flush por llamada.
+- [x] Implementar `CheckpointManager` (`new`/`load`/`save`): persistencia de `(last_chunk, processed_seconds)`.
 - [ ] Probar el flujo de recuperación end-to-end: matar el proceso a mitad de un audio de varias horas y confirmar que retoma desde el checkpoint sin re-transcribir desde el principio.
+- [ ] Corregir que `chunk_index` en `StreamingDecoder` se reinicia en 0 tras un `seek_seconds` real (los timestamps sí quedan correctos, pero la numeración de chunk no continúa la del job original) — relevante recién cuando se implemente el punto anterior.
 
 ## Fase 4 — Embeddings + Qdrant (no iniciado)
 
@@ -39,5 +43,6 @@ Pendientes detectados en el estado actual del código, priorizados de forma apro
 ## Housekeeping
 
 - [ ] `src/handlers/QuadrantConf.json` parece un fixture/ejemplo de payload de Qdrant suelto en `handlers/` — mover a un directorio de fixtures o a `docs/` si es referencia, o a tests si es un caso de prueba.
-- [ ] Tests unitarios para el pipeline (`decoder`, `checkpoint`, `jsonl_writer`) a medida que se implementen — hoy solo hay tests de routing en `router.rs`.
-- [ ] Definir manejo de errores / reintentos cuando `run_pipeline` falla a mitad de un audio largo (hoy `audio_handler.rs` solo hace `eprintln!` y descarta el error silenciosamente en el `tokio::spawn`).
+- [ ] Tests unitarios para `decoder`/`checkpoint`/`jsonl_writer` en aislamiento (hoy la única cobertura de Fase 1/2 es el test de integración `#[ignore]` en `router.rs` que depende de audio real + el modelo).
+- [ ] Manejo de errores / reintentos cuando `run_pipeline` falla a mitad de un audio largo (hoy `audio_handler.rs` loguea el error por `eprintln!` pero no reintenta ni marca el job como `Failed` en `job.json`).
+- [ ] Documentar en el README (o en un script) cómo instalar `ffmpeg`/`ffprobe` para quien clone el repo, ya que ahora son una dependencia real del pipeline.
