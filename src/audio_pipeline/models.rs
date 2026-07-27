@@ -25,12 +25,15 @@ pub struct AudioChunk {
     pub samples: Vec<f32>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TranscriptEntry {
     pub chunk: usize,
     pub start: f32,
     pub end: f32,
     pub text: String,
+    /// Media de `ln(token_probability())` sobre todos los tokens del chunk — confianza de
+    /// Whisper, poblada en `WhisperRunner::transcribe_chunk` (ver CLAUDE.local.md).
+    pub avg_logprob: f32,
 }
 
 #[derive(Serialize, Deserialize, Default)]
