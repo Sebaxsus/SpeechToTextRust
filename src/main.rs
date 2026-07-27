@@ -1,5 +1,6 @@
 pub mod audio_pipeline;
 mod handlers;
+mod rag;
 mod router;
 mod state;
 

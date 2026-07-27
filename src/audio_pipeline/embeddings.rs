@@ -15,9 +15,14 @@ use crate::audio_pipeline::models::TranscriptEntry;
 /// Colección única para todo el corpus (ver CLAUDE.local.md: Qdrant — topología). No una
 /// colección por audio: a la escala de este proyecto (~600 vectores por audio de 5h) el overhead
 /// fijo de HNSW/segmentos/WAL por colección no se justifica dividiendo.
-const COLLECTION_NAME: &str = "transcripts";
+///
+/// `pub(crate)` (junto con `EMBEDDING_MODEL` y `deterministic_point_id` abajo) para que
+/// `crate::rag::retrieval` (Fase 5) los reutilice en vez de duplicar el nombre de colección, el
+/// modelo de embeddings o el esquema de point ID — una divergencia ahí haría que la Fase 5
+/// buscara silenciosamente en la colección equivocada o recalculara IDs que no matchean.
+pub(crate) const COLLECTION_NAME: &str = "transcripts";
 /// `bge-m3` — dense, 1024 dims, soporte multilingüe real (español incluido).
-const EMBEDDING_MODEL: &str = "bge-m3";
+pub(crate) const EMBEDDING_MODEL: &str = "bge-m3";
 const EMBEDDING_DIM: u64 = 1024;
 
 /// Crea la colección `transcripts` si no existe todavía: `Cosine`, vectores+payload `on_disk`
@@ -53,7 +58,7 @@ pub async fn ensure_collection(qdrant: &Qdrant) -> anyhow::Result<()> {
 /// Point ID determinístico (`Uuid::new_v5` sobre `audio_id:chunk_id`, no UUID random) para que un
 /// reintento de esta fase tras un crash haga upsert idempotente en vez de duplicar puntos — ver
 /// CLAUDE.local.md, no hace falta un checkpoint propio para Fase 4.
-fn deterministic_point_id(audio_id: &str, chunk_id: usize) -> String {
+pub(crate) fn deterministic_point_id(audio_id: &str, chunk_id: usize) -> String {
     let name = format!("{audio_id}:{chunk_id}");
     Uuid::new_v5(&Uuid::NAMESPACE_OID, name.as_bytes()).to_string()
 }

@@ -127,24 +127,57 @@ mod tests {
         assert_eq!(contar_entradas(jobs_dir), jobs_antes);
     }
 
-    /// Test de punta a punta con un archivo real hardcodeado: sube el mp3 más chico de
-    /// `sample_Media/` a través del endpoint real y espera a que el pipeline completo
-    /// (decode + resample + chunk + whisper + persistencia JSONL) escriba una transcripción.
-    ///
-    /// Ignorado por defecto porque depende de dos cosas que no están versionadas en el repo:
-    /// `sample_Media/` (audio real del usuario) y `models/ggml-small-q5_1.bin` (el modelo
-    /// GGML). Correr con `cargo test -- --ignored --nocapture` después de colocar el modelo.
-    #[tokio::test]
-    #[ignore = "requiere sample_Media/ real y models/ggml-small-q5_1.bin"]
-    async fn pipeline_hardcodeado_transcribe_audio_real() {
-        const AUDIO_PATH: &str = "sample_Media/Tuesday at 07_17_42 pm.mp3";
+    /// Ruta del audio real usado por el test de punta a punta — configurable vía la variable de
+    /// entorno `TEST_AUDIO_PATH` (no vía argumento de `cargo test`, que el harness de test
+    /// integrado de Rust no expone al binario) para poder probar con cualquier archivo de
+    /// `sample_Media/` sin tocar código. Por defecto usa la muestra corta (~2 min) para que la
+    /// corrida sea rápida durante el desarrollo de las fases siguientes.
+    fn ruta_audio_de_prueba() -> String {
+        std::env::var("TEST_AUDIO_PATH")
+            .unwrap_or_else(|_| "sample_Media/Muestra2_02min.m4a".to_string())
+    }
 
-        let audio_bytes = std::fs::read(AUDIO_PATH)
-            .unwrap_or_else(|e| panic!("no se pudo leer {AUDIO_PATH}: {e}"));
+    /// Content-type + nombre de archivo acordes a la extensión real, solo por prolijidad del
+    /// multipart de prueba — el handler nunca confía en esto, sniffea magic bytes (ver
+    /// `audio_handler.rs`).
+    fn content_type_y_nombre(path: &str) -> (&'static str, String) {
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("audio")
+            .to_string();
+        let content_type = if path.to_lowercase().ends_with(".mp3") {
+            "audio/mpeg"
+        } else {
+            "audio/mp4"
+        };
+        (content_type, filename)
+    }
+
+    /// Test de punta a punta con un archivo real: sube el audio de `ruta_audio_de_prueba()` a
+    /// través del endpoint real, espera a que el pipeline completo (decode + resample + chunk +
+    /// whisper + persistencia JSONL, Fase 2/3) escriba una transcripción, y además confirma que
+    /// la Fase 4 (embeddings) encadenada después del pipeline (ver `audio_handler.rs`) terminó
+    /// insertando puntos en Qdrant para este job — es el primer test que ejercita las fases entre
+    /// sí en vez de aisladas, base para construir el retrieval de Fase 5 encima.
+    ///
+    /// Ignorado por defecto porque depende de piezas que no están versionadas ni siempre
+    /// levantadas: `sample_Media/` (audio real del usuario), `models/ggml-small-q5_1.bin` (el
+    /// modelo GGML), y Ollama (`bge-m3`) + Qdrant reales corriendo en localhost. Correr con
+    /// `cargo test pipeline_hardcodeado -- --ignored --nocapture`, o con otra muestra:
+    /// `TEST_AUDIO_PATH="sample_Media/otro.m4a" cargo test pipeline_hardcodeado -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "requiere sample_Media/ real, models/ggml-small-q5_1.bin, y Ollama+Qdrant reales"]
+    async fn pipeline_hardcodeado_transcribe_audio_real() {
+        let audio_path = ruta_audio_de_prueba();
+
+        let audio_bytes = std::fs::read(&audio_path)
+            .unwrap_or_else(|e| panic!("no se pudo leer {audio_path}: {e}"));
 
         let app = crear_router(estado_de_prueba());
         let boundary = "TESTBOUNDARYREAL";
-        let body = construir_cuerpo_multipart(boundary, "audio.mp3", "audio/mpeg", &audio_bytes);
+        let (content_type, filename) = content_type_y_nombre(&audio_path);
+        let body = construir_cuerpo_multipart(boundary, &filename, content_type, &audio_bytes);
 
         let response = app
             .oneshot(
@@ -191,5 +224,51 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
+
+        // Fase 4 corre encadenada justo después de Fase 2/3 (ver audio_handler.rs) — confirmar
+        // que los embeddings de este job realmente llegaron a Qdrant es lo que hace de este test
+        // una prueba de los módulos entre sí, no solo de Whisper en aislamiento.
+        let qdrant = qdrant_client::Qdrant::from_url("http://localhost:6334")
+            .build()
+            .expect("cliente de Qdrant de prueba");
+        let filter =
+            qdrant_client::qdrant::Filter::must([qdrant_client::qdrant::Condition::matches(
+                "audio_id",
+                job_id.clone(),
+            )]);
+
+        let mut intentos = 0;
+        loop {
+            let count = qdrant
+                .count(
+                    qdrant_client::qdrant::CountPointsBuilder::new("transcripts")
+                        .filter(filter.clone())
+                        .exact(true),
+                )
+                .await
+                .expect("no se pudo contar los puntos del job en Qdrant")
+                .result
+                .expect("respuesta de count sin resultado")
+                .count;
+
+            if count > 0 {
+                println!("Embeddings del job {job_id} encontrados en Qdrant: {count} puntos");
+                break;
+            }
+
+            intentos += 1;
+            assert!(
+                intentos < 60,
+                "timeout esperando los embeddings del job {job_id} en Qdrant"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+
+        // Limpieza: no dejar puntos de este job de prueba en la colección real.
+        let _ = qdrant
+            .delete_points(
+                qdrant_client::qdrant::DeletePointsBuilder::new("transcripts").points(filter),
+            )
+            .await;
     }
 }
