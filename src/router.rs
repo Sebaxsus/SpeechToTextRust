@@ -23,6 +23,10 @@ mod tests {
         Arc::new(AppState {
             nombre_app: "test".to_string(),
             transcription_semaphore: Arc::new(Semaphore::new(1)),
+            ollama: ollama_rs::Ollama::default(),
+            qdrant: qdrant_client::Qdrant::from_url("http://localhost:6334")
+                .build()
+                .expect("cliente de Qdrant de prueba"),
         })
     }
 
@@ -164,7 +168,10 @@ mod tests {
             .unwrap()
             .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        let job_id = json["job_id"].as_str().expect("respuesta sin job_id").to_string();
+        let job_id = json["job_id"]
+            .as_str()
+            .expect("respuesta sin job_id")
+            .to_string();
 
         let transcript_path = format!("./jobs/{job_id}/transcript.jsonl");
 

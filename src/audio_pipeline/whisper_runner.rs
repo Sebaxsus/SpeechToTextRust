@@ -1,4 +1,6 @@
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
+};
 
 /// Wrapper de whisper-rs. Mantiene un único `WhisperState` vivo durante todo el job (no uno por
 /// chunk) para que `set_no_context(false)` realmente aporte continuidad de contexto entre los
@@ -40,17 +42,39 @@ impl WhisperRunner {
         params
     }
 
-    pub fn transcribe_chunk(&mut self, samples: &[f32]) -> anyhow::Result<String> {
+    /// Devuelve el texto transcrito del chunk junto con `avg_logprob`: la media de
+    /// `ln(token_probability())` sobre todos los tokens de todos los segmentos del chunk — una
+    /// medida de confianza para poblar el payload de Qdrant (ver CLAUDE.local.md, campo
+    /// `avg_logprob`). Un chunk sin tokens (silencio puro) devuelve `avg_logprob: 0.0`.
+    pub fn transcribe_chunk(&mut self, samples: &[f32]) -> anyhow::Result<(String, f32)> {
         let params = Self::build_params();
         self.state.full(params, samples)?;
 
         let mut text = String::new();
+        let mut logprob_sum = 0.0f64;
+        let mut token_count = 0u32;
+
         for i in 0..self.state.full_n_segments() {
             let Some(segment) = self.state.get_segment(i) else {
                 continue;
             };
             text.push_str(&segment.to_str_lossy()?);
+
+            for j in 0..segment.n_tokens() {
+                let Some(token) = segment.get_token(j) else {
+                    continue;
+                };
+                logprob_sum += (token.token_probability() as f64).ln();
+                token_count += 1;
+            }
         }
-        Ok(text)
+
+        let avg_logprob = if token_count > 0 {
+            (logprob_sum / token_count as f64) as f32
+        } else {
+            0.0
+        };
+
+        Ok((text, avg_logprob))
     }
 }

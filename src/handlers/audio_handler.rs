@@ -1,3 +1,4 @@
+use crate::audio_pipeline::embeddings::run_embedding_phase;
 use crate::audio_pipeline::job::create_job;
 use crate::audio_pipeline::pipeline::run_pipeline;
 use crate::state::SharedState;
@@ -115,6 +116,8 @@ pub async fn recibir_y_procesar_audio(
 
     tokio::spawn({
         let state = state.clone();
+        let audio_id = metadata.job_id.clone();
+        let transcript_path = metadata.transcript_path.clone();
 
         async move {
             let permit = state
@@ -126,10 +129,24 @@ pub async fn recibir_y_procesar_audio(
 
             let _permit = permit;
 
+            // Fase 2/3 (Whisper, CPU-bound) corre entera dentro de spawn_blocking y termina de
+            // liberar WhisperRunner antes de que Fase 4 (embeddings, I/O-bound) arranque — nunca
+            // se solapan Whisper y Ollama (ver CLAUDE.local.md: Concurrencia).
             match tokio::task::spawn_blocking(move || run_pipeline(metadata)).await {
                 Ok(Err(e)) => eprintln!("Error en el pipeline: {}", e),
                 Err(e) => eprintln!("Error en el pipeline (join error): {}", e),
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    if let Err(e) = run_embedding_phase(
+                        &state.ollama,
+                        &state.qdrant,
+                        &audio_id,
+                        &transcript_path,
+                    )
+                    .await
+                    {
+                        eprintln!("Error en la fase de embeddings: {}", e);
+                    }
+                }
             }
         }
     });

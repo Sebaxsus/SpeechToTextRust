@@ -13,18 +13,22 @@ pub fn run_pipeline(metadata: JobMetadata) -> anyhow::Result<()> {
 
     let cp = checkpoint.load()?;
 
-    decoder.seek_seconds(cp.processed_seconds)?;
+    // `last_chunk` es el último chunk que terminó de procesarse antes del corte (o 0 si no hay
+    // checkpoint todavía) — el resume retoma en el siguiente. Sin checkpoint, `processed_seconds`
+    // también es 0.0, así que `seek_seconds` hace early-return y `resume_from_chunk` se ignora.
+    decoder.seek_seconds(cp.processed_seconds, cp.last_chunk + 1)?;
 
     let mut runner = WhisperRunner::new("models/ggml-small-q5_1.bin")?;
 
     while let Some(chunk) = decoder.next_chunk()? {
-        let text = runner.transcribe_chunk(&chunk.samples)?;
+        let (text, avg_logprob) = runner.transcribe_chunk(&chunk.samples)?;
 
         writer.append(TranscriptEntry {
             chunk: chunk.index,
             start: chunk.start_sec,
             end: chunk.end_sec,
             text,
+            avg_logprob,
         })?;
 
         checkpoint.save(chunk.index, chunk.end_sec)?;
