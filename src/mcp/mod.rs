@@ -85,8 +85,11 @@ fn error_interno(contexto: &str, err: anyhow::Error) -> McpError {
     McpError::internal_error(contexto.to_string(), None)
 }
 
-/// Lee `./jobs/*/job.json` (mismo layout que `audio_pipeline::job::create_job`). Un directorio
-/// sin `job.json` legible se saltea con un log en vez de abortar el listado completo.
+/// Enumera `./jobs/*` y delega en `audio_pipeline::job::load_job` (mismo loader validado que usa
+/// el endpoint de resume, ver `handlers::audio_handler::reanudar_job`) para leer cada `job.json`
+/// — un directorio sin `job.json` legible se saltea con un log en vez de abortar el listado
+/// completo. Los nombres de directorio ya son UUIDs generados por `create_job`, así que la
+/// validación de UUID de `load_job` nunca falla acá; se reusa igual para no duplicar el parseo.
 async fn listar_jobs() -> anyhow::Result<Vec<JobMetadata>> {
     let mut entradas = tokio::fs::read_dir("./jobs").await?;
     let mut jobs = Vec::new();
@@ -94,24 +97,21 @@ async fn listar_jobs() -> anyhow::Result<Vec<JobMetadata>> {
         if !entrada.file_type().await?.is_dir() {
             continue;
         }
-        let job_json_path = entrada.path().join("job.json");
-        match tokio::fs::read_to_string(&job_json_path).await {
-            Ok(contenido) => match serde_json::from_str::<JobMetadata>(&contenido) {
-                Ok(metadata) => jobs.push(metadata),
-                Err(e) => eprintln!("job.json inválido en {job_json_path:?}: {e}"),
-            },
-            Err(e) => eprintln!("No se pudo leer {job_json_path:?}: {e}"),
+        let job_id = entrada.file_name().to_string_lossy().into_owned();
+        match crate::audio_pipeline::job::load_job(&job_id) {
+            Ok(metadata) => jobs.push(metadata),
+            Err(e) => eprintln!("No se pudo leer el job '{job_id}': {e}"),
         }
     }
     Ok(jobs)
 }
 
+/// `audio_id` viene directo de un argumento de tool MCP (no confiable) — `load_job` valida que
+/// sea un UUID bien formado antes de usarlo en una ruta de disco, así que acá no hace falta
+/// repetir esa validación (a diferencia de la versión anterior de esta función, que construía la
+/// ruta a mano sin validar nada).
 async fn leer_job(audio_id: &str) -> anyhow::Result<JobMetadata> {
-    let job_json_path = std::path::Path::new("./jobs")
-        .join(audio_id)
-        .join("job.json");
-    let contenido = tokio::fs::read_to_string(job_json_path).await?;
-    Ok(serde_json::from_str(&contenido)?)
+    crate::audio_pipeline::job::load_job(audio_id)
 }
 
 #[derive(Clone)]

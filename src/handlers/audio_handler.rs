@@ -1,9 +1,10 @@
 use crate::audio_pipeline::embeddings::run_embedding_phase;
-use crate::audio_pipeline::job::create_job;
+use crate::audio_pipeline::job::{create_job, load_job};
+use crate::audio_pipeline::models::JobMetadata;
 use crate::audio_pipeline::pipeline::run_pipeline;
 use crate::state::SharedState;
 use axum::{
-    extract::{Multipart, State},
+    extract::{Multipart, Path, State},
     http::StatusCode,
     response::IntoResponse,
 };
@@ -114,42 +115,76 @@ pub async fn recibir_y_procesar_audio(
         nombre_archivo, job_id
     );
 
-    tokio::spawn({
-        let state = state.clone();
+    lanzar_procesamiento_job(state, metadata);
+
+    (
+        StatusCode::ACCEPTED,
+        axum::Json(serde_json::json!({
+            "job_id": job_id,
+            "status": "processing",
+        })),
+    )
+        .into_response()
+}
+
+/// Corre Fase 2/3 (Whisper) y, si termina bien, encadena Fase 4 (embeddings) — la misma cadena
+/// tanto para un job recién creado (`recibir_y_procesar_audio`) como para uno reanudado
+/// (`reanudar_job`). No hace falta distinguir "nuevo" de "reanudado" acá: `run_pipeline` ya es
+/// resume-safe por sí mismo (lee `checkpoint.json` y retoma donde cortó — ver `pipeline.rs`), y
+/// `run_embedding_phase` es idempotente (point ID determinístico), así que reintentar Fase 4
+/// sobre un transcript ya embebido tampoco duplica vectores.
+fn lanzar_procesamiento_job(state: SharedState, metadata: JobMetadata) {
+    tokio::spawn(async move {
+        let permit = state
+            .transcription_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let _permit = permit;
+
         let audio_id = metadata.job_id.clone();
         let transcript_path = metadata.transcript_path.clone();
 
-        async move {
-            let permit = state
-                .transcription_semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .unwrap();
-
-            let _permit = permit;
-
-            // Fase 2/3 (Whisper, CPU-bound) corre entera dentro de spawn_blocking y termina de
-            // liberar WhisperRunner antes de que Fase 4 (embeddings, I/O-bound) arranque — nunca
-            // se solapan Whisper y Ollama (ver CLAUDE.local.md: Concurrencia).
-            match tokio::task::spawn_blocking(move || run_pipeline(metadata)).await {
-                Ok(Err(e)) => eprintln!("Error en el pipeline: {}", e),
-                Err(e) => eprintln!("Error en el pipeline (join error): {}", e),
-                Ok(Ok(())) => {
-                    if let Err(e) = run_embedding_phase(
-                        &state.ollama,
-                        &state.qdrant,
-                        &audio_id,
-                        &transcript_path,
-                    )
-                    .await
-                    {
-                        eprintln!("Error en la fase de embeddings: {}", e);
-                    }
+        // Fase 2/3 (Whisper, CPU-bound) corre entera dentro de spawn_blocking y termina de
+        // liberar WhisperRunner antes de que Fase 4 (embeddings, I/O-bound) arranque — nunca
+        // se solapan Whisper y Ollama (ver CLAUDE.local.md: Concurrencia).
+        match tokio::task::spawn_blocking(move || run_pipeline(metadata)).await {
+            Ok(Err(e)) => eprintln!("Error en el pipeline: {}", e),
+            Err(e) => eprintln!("Error en el pipeline (join error): {}", e),
+            Ok(Ok(())) => {
+                if let Err(e) =
+                    run_embedding_phase(&state.ollama, &state.qdrant, &audio_id, &transcript_path)
+                        .await
+                {
+                    eprintln!("Error en la fase de embeddings: {}", e);
                 }
             }
         }
     });
+}
+
+/// `POST /api/jobs/{job_id}/resume` — reanuda un job existente cuyo procesamiento se cortó a
+/// mitad de camino (proceso matado, crash, etc. — ver docs/TODO.md, Fase 3). `run_pipeline` ya
+/// era resume-safe a nivel de función; lo que faltaba era este entry point HTTP.
+///
+/// Deliberadamente NO es una tool de MCP (ver CLAUDE.local.md: "MCP de solo lectura") — el
+/// servidor MCP nunca dispara procesamiento, ni siquiera para "solo continuar" algo ya pedido,
+/// porque esa es la línea que hace aceptable exponerlo en LAN.
+pub async fn reanudar_job(
+    State(state): State<SharedState>,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    let metadata = match load_job(&job_id) {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            eprintln!("No se pudo reanudar el job '{job_id}': {e}");
+            return (StatusCode::NOT_FOUND, "Job no encontrado").into_response();
+        }
+    };
+
+    lanzar_procesamiento_job(state, metadata);
 
     (
         StatusCode::ACCEPTED,

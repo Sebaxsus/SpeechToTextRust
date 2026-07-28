@@ -1,4 +1,4 @@
-use crate::handlers::audio_handler::recibir_y_procesar_audio;
+use crate::handlers::audio_handler::{reanudar_job, recibir_y_procesar_audio};
 use crate::mcp;
 use crate::state::SharedState;
 use axum::{
@@ -64,6 +64,7 @@ fn crear_router_mcp(estado: SharedState) -> Router {
 pub fn crear_router(estado: SharedState) -> Router {
     Router::new()
         .route("/api/upload-audio", post(recibir_y_procesar_audio))
+        .route("/api/jobs/{job_id}/resume", post(reanudar_job))
         .with_state(estado.clone())
         .merge(crear_router_mcp(estado))
 }
@@ -125,6 +126,47 @@ mod tests {
         // El extractor Multipart de axum rechaza la petición antes de que el handler corra
         // si el content-type no es multipart/form-data con boundary.
         assert!(response.status().is_client_error());
+    }
+
+    #[tokio::test]
+    async fn resume_de_job_inexistente_devuelve_404() {
+        let app = crear_router(estado_de_prueba());
+        let job_id = uuid::Uuid::new_v4();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/jobs/{job_id}/resume"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `job_id` llega crudo desde el path de la URL — un valor que no es un UUID (ej. un intento
+    /// de path traversal como `../../etc`) tiene que rechazarse igual que uno bien formado pero
+    /// inexistente, nunca usarse tal cual para construir una ruta de disco (ver
+    /// `audio_pipeline::job::load_job`).
+    #[tokio::test]
+    async fn resume_con_job_id_no_uuid_devuelve_404_sin_tocar_disco_fuera_de_jobs() {
+        let app = crear_router(estado_de_prueba());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/jobs/no-es-un-uuid/resume")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     fn construir_cuerpo_multipart(
