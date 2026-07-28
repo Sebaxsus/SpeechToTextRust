@@ -1,12 +1,71 @@
 use crate::handlers::audio_handler::recibir_y_procesar_audio;
+use crate::mcp;
 use crate::state::SharedState;
-use axum::{Router, routing::post};
+use axum::{
+    Router,
+    extract::{Request, State},
+    http::{StatusCode, header::AUTHORIZATION},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::post,
+};
+use std::sync::Arc;
+
+/// Token opcional para autenticar el endpoint `/mcp` (ver CLAUDE.local.md: "MCP de solo
+/// lectura" — "Bearer token en el endpoint MCP antes de bindear a la IP de LAN"). Leído una sola
+/// vez al armar el router, no en cada request.
+#[derive(Clone)]
+struct McpAuthState {
+    token: Option<Arc<str>>,
+}
+
+async fn exigir_bearer_token(
+    State(auth): State<McpAuthState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(esperado) = &auth.token else {
+        // Sin MCP_BEARER_TOKEN configurado: sin autenticación. Aceptable solo mientras el
+        // servidor no se expone más allá de localhost — ver advertencia impresa en main.rs.
+        return next.run(req).await;
+    };
+
+    let autorizado = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|token| token == esperado.as_ref());
+
+    if autorizado {
+        next.run(req).await
+    } else {
+        StatusCode::UNAUTHORIZED.into_response()
+    }
+}
+
+/// Router del endpoint MCP (`/mcp`, Streamable HTTP) separado del router principal porque tiene
+/// su propio estado de autenticación (`McpAuthState`), distinto de `SharedState` — se mergea
+/// después vía `Router::merge`, no `nest`, así que ambos quedan al mismo nivel (`/api/...` y
+/// `/mcp` como rutas hermanas, no una anidada dentro de la otra a nivel de path).
+fn crear_router_mcp(estado: SharedState) -> Router {
+    let token = std::env::var("MCP_BEARER_TOKEN").ok().map(Arc::from);
+    let auth_state = McpAuthState { token };
+
+    Router::new()
+        .nest_service("/mcp", mcp::build_service(estado))
+        .route_layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            exigir_bearer_token,
+        ))
+        .with_state(auth_state)
+}
 
 pub fn crear_router(estado: SharedState) -> Router {
     Router::new()
         .route("/api/upload-audio", post(recibir_y_procesar_audio))
-        // Aquí agregaremos .route("/api/contexto", post(...)) más adelante
-        .with_state(estado)
+        .with_state(estado.clone())
+        .merge(crear_router_mcp(estado))
 }
 
 #[cfg(test)]

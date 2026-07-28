@@ -1,0 +1,157 @@
+### Peticiones de ejemplo para el servidor MCP (Fase 6) de este proyecto.
+### Requiere la extensión "REST Client" de VSCode (humao.rest-client).
+### Ver docs/MCP_Testing.md para la explicación completa del protocolo y del orden de estas peticiones.
+###
+### Uso: con el servidor corriendo (`cargo run`) y Ollama + Qdrant arriba, abrí este archivo en
+### VSCode y hacé click en "Send Request" arriba de cada bloque, EN ORDEN — cada uno depende del
+### anterior (la sesión que abre "1. Initialize" se reutiliza en el resto vía Mcp-Session-Id).
+
+@baseUrl = http://localhost:3000
+@token =
+
+### 1. Initialize — arranca el handshake MCP y abre la sesión.
+# @name initialize
+POST {{baseUrl}}/mcp
+Content-Type: application/json
+Accept: application/json, text/event-stream
+# Authorization: Bearer {{token}}
+
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "initialize",
+  "params": {
+    "protocolVersion": "2025-06-18",
+    "capabilities": {},
+    "clientInfo": { "name": "vscode-rest-client", "version": "1.0" }
+  }
+}
+
+### 2. notifications/initialized — cierra el handshake. Sin esto el servidor puede rechazar las
+### siguientes llamadas. Toma el session id de la respuesta del paso 1.
+POST {{baseUrl}}/mcp
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{initialize.response.headers.mcp-session-id}}
+# Authorization: Bearer {{token}}
+
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/initialized"
+}
+
+### 3. tools/list — lista las 4 tools expuestas: search_transcript, rag_answer, list_audios,
+### get_audio_metadata (con su JSON Schema de parámetros).
+POST {{baseUrl}}/mcp
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{initialize.response.headers.mcp-session-id}}
+# Authorization: Bearer {{token}}
+
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/list"
+}
+
+### 4. tools/call list_audios — sin argumentos. Lee ./jobs/*/job.json y devuelve todos los jobs
+### procesados. Usá un audio_id de acá para completar los pasos siguientes.
+POST {{baseUrl}}/mcp
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{initialize.response.headers.mcp-session-id}}
+# Authorization: Bearer {{token}}
+
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "list_audios",
+    "arguments": {}
+  }
+}
+
+### 5. tools/call get_audio_metadata — reemplazá "audio_id" por un job_id real de la respuesta
+### anterior.
+POST {{baseUrl}}/mcp
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{initialize.response.headers.mcp-session-id}}
+# Authorization: Bearer {{token}}
+
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "method": "tools/call",
+  "params": {
+    "name": "get_audio_metadata",
+    "arguments": { "audio_id": "REEMPLAZAR-CON-UN-JOB-ID-REAL" }
+  }
+}
+
+### 6. tools/call search_transcript, scope "audio" — retrieval puro (sin generación) dentro de un
+### solo audio_id. Reemplazá "audio_id" por uno real.
+POST {{baseUrl}}/mcp
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{initialize.response.headers.mcp-session-id}}
+# Authorization: Bearer {{token}}
+
+{
+  "jsonrpc": "2.0",
+  "id": 5,
+  "method": "tools/call",
+  "params": {
+    "name": "search_transcript",
+    "arguments": {
+      "query": "¿de qué hablaron sobre el presupuesto?",
+      "scope": "audio",
+      "audio_id": "REEMPLAZAR-CON-UN-JOB-ID-REAL"
+    }
+  }
+}
+
+### 7. tools/call search_transcript, scope "all_corpus" — busca en todas las reuniones y activa
+### el reranker de cross-encoder. Más lento la primera vez (descarga BAAI/bge-reranker-v2-m3 si
+### todavía no está en la cache de Hugging Face).
+POST {{baseUrl}}/mcp
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{initialize.response.headers.mcp-session-id}}
+# Authorization: Bearer {{token}}
+
+{
+  "jsonrpc": "2.0",
+  "id": 6,
+  "method": "tools/call",
+  "params": {
+    "name": "search_transcript",
+    "arguments": {
+      "query": "¿de qué hablaron sobre el presupuesto?",
+      "scope": "all_corpus"
+    }
+  }
+}
+
+### 8. tools/call rag_answer — retrieval + generación vía Ollama (qcwind/qwen2.5-7b-instruct).
+### Puede tardar varios segundos: es un modelo de 7-8B corriendo en CPU. Reemplazá "audio_id".
+POST {{baseUrl}}/mcp
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{initialize.response.headers.mcp-session-id}}
+# Authorization: Bearer {{token}}
+
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "tools/call",
+  "params": {
+    "name": "rag_answer",
+    "arguments": {
+      "question": "¿Cuál es el presupuesto del proyecto?",
+      "scope": "audio",
+      "audio_id": "REEMPLAZAR-CON-UN-JOB-ID-REAL"
+    }
+  }
+}

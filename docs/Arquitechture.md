@@ -71,12 +71,17 @@ Módulo `src/rag/` (`retrieval.rs`, `reranker.rs`, `generation.rs`) — separado
 - **Sin interfaz todavía**: `rag_answer`/`search` no están conectados a ningún endpoint Axum — el consumidor real es el servidor MCP de Fase 6. `src/rag/mod.rs` tiene un `#![allow(dead_code, unused_imports)]` documentado, a quitar cuando Fase 6 los llame.
 - **Generación — opcional: Gemini Nano client-side** vía Chrome Built-in AI (Prompt API), activable como toggle explícito del usuario, nunca automático. En este camino el servidor solo hace retrieval (sin generación) y manda los chunks recuperados al browser, que genera la respuesta 100% on-device con streaming nativo. Requiere detección de capability y fallback a Ollama si el navegador no la soporta. Fuera del alcance del binario de Rust — se invoca desde JS en el navegador.
 
-## Fase 6 — MCP de solo lectura + interfaz web (no implementado aún)
+## Fase 6 — MCP de solo lectura (servidor implementado y probado; interfaz web pendiente)
 
-- `rmcp` (SDK oficial de Rust para MCP) montado sobre el mismo servidor Axum vía transporte Streamable HTTP — sin microservicio aparte.
-- Tools, todas de solo lectura (nunca escriben/borran en Qdrant ni disparan transcripciones): `search_transcript(query, scope)` (retrieval only, alimenta el camino de Gemini Nano client-side), `rag_answer(question, scope)` (retrieval + generación vía Ollama — default y fallback cuando Gemini Nano no aplica), `list_audios()` / `get_audio_metadata(audio_id)`.
-- **Exposición en LAN**: el servidor se bindea también a la IP de red local para que otro dispositivo lo consulte (motivo: performance, no correr el pipeline pesado en el equipo más débil). Requiere bearer token en el endpoint MCP — de solo lectura no implica sin autenticación, dado que expone contenido transcrito de reuniones.
+Módulo `src/mcp/mod.rs`. `rmcp` 2.2.0 (SDK oficial de Rust para MCP) montado sobre el mismo servidor Axum vía transporte Streamable HTTP (`Router::nest_service("/mcp", ...)`, ver `router.rs`) — sin microservicio aparte.
+
+- **Tools, todas de solo lectura** (nunca escriben/borran en Qdrant ni disparan transcripciones — delegan en `rag::retrieval`/`rag::generation` de Fase 5, o leen `job.json` de disco): `search_transcript(query, scope)` (retrieval only, alimenta el camino de Gemini Nano client-side), `rag_answer(question, scope)` (retrieval + generación vía Ollama — default y fallback cuando Gemini Nano no aplica), `list_audios()` / `get_audio_metadata(audio_id)`.
+- **`scope` sin default implícito**: expuesto vía `ScopeArg`, un enum `#[serde(tag = "scope")]` que refleja 1:1 `rag::retrieval::SearchScope` — el caller de la tool tiene que mandar `{"scope":"audio","audio_id":"..."}` o `{"scope":"all_corpus"}` explícitamente, igual que a nivel de Rust (ver Fase 5, "Scope forzado").
+- **Autenticación**: bearer token opcional vía `MCP_BEARER_TOKEN` (middleware `exigir_bearer_token` en `router.rs`, scopeado solo a `/mcp` con `route_layer`, no al resto del Axum). Si no está configurado, `/mcp` queda sin autenticación y el servidor lo advierte por consola al arrancar — aceptable solo mientras no se expone más allá de `localhost`.
+- **Exposición en LAN — pendiente, no solo el bearer token**: además de configurar `MCP_BEARER_TOKEN`, `StreamableHttpServerConfig` (default de `rmcp`) solo permite `Host` headers de `localhost`/`127.0.0.1`/`::1` (protección anti DNS-rebinding); hay que ampliar `allowed_hosts` a la IP de LAN real antes de que un cliente remoto pueda conectarse (hoy devuelve `403`). Ver `docs/TODO.md`.
+- **Probado end-to-end**: handshake completo (`initialize` → `notifications/initialized` → `tools/list` → `tools/call`) contra el servidor real (Ollama + Qdrant arriba), reproducido con `curl` y documentado para la extensión REST Client de VSCode en `docs/MCP_Testing.md` / `docs/mcp-requests.http`. No probado todavía contra un cliente MCP real (Claude Desktop u otro).
 - **Fase opcional — WebSocket + TLS** para la conversación interfaz↔RAG (además del MCP): `axum-server` + `rustls` (certificado autofirmado válido para LAN), streaming de tokens y sesión persistente multi-turno. No es parte del MVP (que funciona con request/response simple vía MCP); es una mejora de UX posterior.
+- **Interfaz web**: todavía no implementada — fuera del alcance de esta iteración.
 
 ## Concurrencia
 
