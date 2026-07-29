@@ -5,6 +5,7 @@ use anyhow::Context;
 use uuid::Uuid;
 
 use crate::audio_pipeline::models::{JobMetadata, JobStatus};
+use crate::audio_pipeline::util::write_atomic;
 
 /// Creates a fresh job directory (`./jobs/{job_id}/`) and the associated metadata.
 ///
@@ -37,7 +38,7 @@ pub fn create_job(extension: &str) -> anyhow::Result<JobMetadata> {
 
     let job_json_path = job_dir.join("job.json");
     let job_json = serde_json::to_string_pretty(&metadata)?;
-    fs::write(job_json_path, job_json)?;
+    write_atomic(&job_json_path, &job_json)?;
 
     Ok(metadata)
 }

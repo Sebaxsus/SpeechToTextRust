@@ -197,6 +197,10 @@ cargo test
 
 (Los tests `--ignored` se corren aparte, manualmente, porque dependen de servicios externos vivos y en algunos casos de una descarga inicial.)
 
+## Limitaciones conocidas
+
+- **No hay forma confiable de detectar un job "atascado"**: si el proceso completo del servidor muere (no un error capturado dentro del pipeline, sino el binario cayendo), `job.json.status` queda en `Processing` para siempre — nada distingue eso de un audio de 5h que legítimamente sigue transcribiendo. La señal más precisa disponible es el `mtime` de `checkpoint.json` (se reescribe tras cada chunk de ~30s, así que "hace cuánto no se mueve" mide actividad real), pero **no existe un umbral universal**: cuánto tarda un chunk depende de la máquina, la carga concurrente y el hardware real donde corre el proceso, así que cualquier número fijo sería una verdad relativa a una laptop específica, no una garantía general. Ver `docs/TODO.md` (sección "Nuevos endpoints REST para el cliente web") para el detalle de diseño — deliberadamente sin implementar hasta tener una medición real de cuánto tarda un chunk en condiciones normales.
+
 ## Documentación
 
 - [`docs/Arquitechture.md`](docs/Arquitechture.md) — arquitectura y decisiones de diseño por fase.

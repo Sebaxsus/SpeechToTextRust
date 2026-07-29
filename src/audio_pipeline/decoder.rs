@@ -48,6 +48,22 @@ enum Source {
     },
 }
 
+impl Drop for Source {
+    /// Sin esto, un corte del pipeline que no llegue a EOF ni pase por un seek explícito (los
+    /// únicos dos lugares que hoy llaman `child.wait()`/`kill()` — ej. Whisper falla un chunk y
+    /// el `?` de `run_pipeline` propaga el error, o un panic) deja el proceso `ffmpeg` huérfano:
+    /// dropear un `std::process::Child` en Rust nunca mata el proceso, solo cierra el handle.
+    /// `kill()`/`wait()` sobre un proceso ya terminado (ej. el camino de EOF, que ya hizo su
+    /// propio `wait()`) devuelven `Err`, ignorado a propósito — este `Drop` es una red de
+    /// seguridad, no la única vía esperada de limpieza.
+    fn drop(&mut self) {
+        if let Source::Ffmpeg { child, .. } = self {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Resultado de decodificar un paso (un paquete de Symphonia, o un bloque leído del pipe de
 /// ffmpeg): o bien produjo muestras interleaved con su spec, o el stream terminó.
 enum PumpOutcome {
