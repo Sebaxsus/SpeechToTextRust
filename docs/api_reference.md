@@ -8,7 +8,7 @@ Estado actual de la superficie HTTP del servidor (`src/main.rs`, `src/router.rs`
 
 - Bind: `0.0.0.0:3000` — el servidor ya escucha en todas las interfaces (LAN incluida), no solo `localhost`. Ver "Exposición en LAN — gaps" más abajo antes de considerar esto seguro para un cliente remoto.
 - Clientes construidos una sola vez en `main.rs` y compartidos vía `Arc<AppState>` (`src/state.rs`): `Ollama::default()` (`http://127.0.0.1:11434`) y `Qdrant::from_url("http://localhost:6334")`. Son clientes livianos (no cargan modelos) — construirlos al boot no viola la regla de "nunca dejar Whisper/Ollama residentes".
-- `transcription_semaphore` (`Semaphore::new(1)`): como máximo una transcripción pesada corriendo a la vez, en todo el proceso — compartido entre `POST /api/upload-audio` y `POST /api/jobs/{job_id}/resume`.
+- `heavy_compute_semaphore` (`Semaphore::new(1)`): como máximo una carga pesada de CPU/modelo a la vez en todo el proceso — compartido entre `POST /api/upload-audio`/`POST /api/jobs/{job_id}/resume` (Whisper) y las tools MCP `search_transcript`/`rag_answer` (Ollama/reranker). Antes se llamaba `transcription_semaphore` y solo gateaba el pipeline de audio; se amplió (2026-07-29) tras detectar que las tools de RAG no tenían ningún gate de concurrencia propio.
 - Si `MCP_BEARER_TOKEN` no está seteado en el entorno, el proceso imprime una advertencia por consola al arrancar (no rechaza arrancar, no rechaza bindear a `0.0.0.0`) — ver "Autenticación" más abajo.
 
 No hay healthcheck (`GET /health` o similar) implementado todavía.
@@ -53,7 +53,7 @@ Sube un archivo de audio, crea un job nuevo (`job_id` UUID v4) y dispara el pipe
 
 ### Qué dispara en background (no forma parte de la respuesta HTTP)
 
-1. Adquiere 1 permiso de `transcription_semaphore` (bloquea si ya hay una transcripción corriendo).
+1. Adquiere 1 permiso de `heavy_compute_semaphore` (espera si ya hay una transcripción corriendo, o si una consulta RAG vía MCP está usando el permiso).
 2. `run_pipeline` (Whisper, Fase 2/3) dentro de `spawn_blocking` — escribe `transcript.jsonl` incrementalmente y `checkpoint.json` tras cada chunk.
 3. Si `run_pipeline` termina en `Ok(Ok(()))`, encadena `run_embedding_phase` (Fase 4, embeddings a Qdrant) como tarea async normal.
 4. Cualquier error en cualquiera de los dos pasos solo se loguea por `eprintln!` — no hay reintento automático ni actualización de `job.json.status` a `Failed` (gap conocido, ver `docs/TODO.md` → Housekeeping).
@@ -116,6 +116,8 @@ Middleware `exigir_bearer_token` (`router.rs`), aplicado solo a `/mcp` (`route_l
 ### Tools disponibles
 
 Las 4 tools son de **solo lectura** por diseño — ninguna escribe/borra en Qdrant ni dispara transcripciones nuevas (regla dura, ver `CLAUDE.local.md`).
+
+**`search_transcript` y `rag_answer` esperan el mismo `heavy_compute_semaphore` que usa Whisper** (2026-07-29) — si hay una transcripción en curso, la tool queda esperando el permiso antes de correr, potencialmente varios minutos en un audio largo. `list_audios`/`get_audio_metadata` no esperan nada (solo leen `job.json` de disco).
 
 #### `search_transcript`
 

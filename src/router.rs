@@ -82,7 +82,7 @@ mod tests {
     fn estado_de_prueba() -> SharedState {
         Arc::new(AppState {
             nombre_app: "test".to_string(),
-            transcription_semaphore: Arc::new(Semaphore::new(1)),
+            heavy_compute_semaphore: Arc::new(Semaphore::new(1)),
             ollama: ollama_rs::Ollama::default(),
             qdrant: qdrant_client::Qdrant::from_url("http://localhost:6334")
                 .build()

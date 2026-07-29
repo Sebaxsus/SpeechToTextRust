@@ -146,6 +146,19 @@ impl RagServer {
         &self,
         Parameters(SearchTranscriptRequest { query, scope }): Parameters<SearchTranscriptRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // Mismo permiso que Whisper (ver CLAUDE.local.md: "NO paralelismo agresivo") — con
+        // `scope: all_corpus` esto dispara el reranker cross-encoder (CPU-bound, `candle`), así
+        // que nunca debe correr a la vez que una transcripción. Si Whisper está transcribiendo,
+        // esta llamada espera acá (potencialmente minutos en un audio largo) en vez de competir
+        // por los mismos threads de CPU.
+        let _permit = self
+            .state
+            .heavy_compute_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
         let hits = search(
             &self.state.ollama,
             &self.state.qdrant,
@@ -174,6 +187,16 @@ impl RagServer {
         &self,
         Parameters(RagAnswerRequest { question, scope }): Parameters<RagAnswerRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // Mismo permiso que Whisper y search_transcript — acá además se suma la generación con
+        // el modelo de 7-8B en Ollama, la carga más pesada de las dos rutas de RAG.
+        let _permit = self
+            .state
+            .heavy_compute_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
         let respuesta = ejecutar_rag_answer(
             &self.state.ollama,
             &self.state.qdrant,

@@ -136,7 +136,7 @@ pub async fn recibir_y_procesar_audio(
 fn lanzar_procesamiento_job(state: SharedState, metadata: JobMetadata) {
     tokio::spawn(async move {
         let permit = state
-            .transcription_semaphore
+            .heavy_compute_semaphore
             .clone()
             .acquire_owned()
             .await

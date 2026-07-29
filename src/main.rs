@@ -20,7 +20,7 @@ async fn main() {
     // 1. Inicializamos nuestro estado compartido
     let estado = Arc::new(AppState {
         nombre_app: "Rust RAG Local-First".to_string(),
-        transcription_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+        heavy_compute_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         ollama,
         qdrant,
     });

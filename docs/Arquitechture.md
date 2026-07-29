@@ -21,7 +21,7 @@ El pipeline nunca mantiene dos cargas pesadas (Whisper, Ollama) residentes en me
 - **Validación por magic bytes, no por extensión declarada**: se lee el primer chunk del stream *antes* de crear ningún archivo o directorio, y se detecta el contenedor real (`ID3`/frame sync MPEG → mp3; caja `ftyp` ISO-BMFF → mp4, cubre también `.m4a`). Cualquier otro contenido se rechaza con `400` sin tocar disco.
 - `audio_pipeline::job::create_job(extension)` genera un `job_id` (UUID v4) y una carpeta propia `./jobs/{job_id}/` con `audio_path`/`transcript_path`/`checkpoint_path` fijos y un `job.json` con la metadata inicial (`status: Pending`).
 - El nombre de archivo que manda el cliente **nunca se usa como parte de una ruta de disco** — solo se usa para logging. Esto elimina path traversal por construcción en vez de "sanearlo".
-- Tras guardar el archivo, adquiere un permiso de `transcription_semaphore` (1 solo permit — ver `state.rs`) y lanza el pipeline en background con `tokio::spawn` + `tokio::task::spawn_blocking` para la parte CPU-bound.
+- Tras guardar el archivo, adquiere un permiso de `heavy_compute_semaphore` (1 solo permit — ver `state.rs`) y lanza el pipeline en background con `tokio::spawn` + `tokio::task::spawn_blocking` para la parte CPU-bound.
 - La respuesta `202` incluye el `job_id` (JSON) para que el cliente pueda consultar el resultado más adelante.
 
 ## Fase 2 — Whisper (`audio_pipeline/decoder.rs`, `whisper_runner.rs`, `pipeline.rs`) — implementado
@@ -86,7 +86,7 @@ Módulo `src/mcp/mod.rs`. `rmcp` 2.2.0 (SDK oficial de Rust para MCP) montado so
 
 ## Concurrencia
 
-- `AppState.transcription_semaphore` limita a **una** transcripción pesada simultánea (`tokio::sync::Semaphore::new(1)`), para evitar CPU thrashing, invalidación de cache y thermal throttling en la laptop objetivo. Ver `router.rs` / `state.rs`.
+- `AppState.heavy_compute_semaphore` (`tokio::sync::Semaphore::new(1)`, ver `state.rs`) limita a **una sola carga pesada de CPU/modelo a la vez en todo el proceso** — no solo la transcripción. Whisper (`run_pipeline`, vía `POST /api/upload-audio`/`resume`) y las tools de RAG server-side de MCP (`search_transcript` con `scope: all_corpus` — dispara el reranker cross-encoder — y `rag_answer` — generación con el modelo de 7-8B) compiten por el mismo único permiso. Esto cierra un gap real detectado en revisión de código (2026-07-29): antes de este fix, una consulta RAG podía correr en paralelo a una transcripción de Whisper, dos cargas CPU-bound compitiendo por los mismos threads — exactamente lo que "NO paralelismo agresivo" prohíbe. `list_audios`/`get_audio_metadata` (solo leen `job.json` de disco) no adquieren este permiso — no son carga pesada.
 - Nada de paralelismo agresivo entre chunks ni entre jobs.
 
 ## Por qué no hay arquitectura distribuida

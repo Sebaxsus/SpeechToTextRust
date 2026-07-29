@@ -26,7 +26,7 @@ Tres estrategias evaluadas, cada una con un costo real distinto:
 - Una sola llamada corta — costo mínimo, similar a B pero explícitamente acotado (no hay sorpresa de truncamiento silencioso).
 - Riesgo de calidad conocido de antemano: si la reunión arranca con charla informal o gente entrando, el resumen puede no reflejar el tema real tratado después. Va directamente en contra de la prioridad #1 del proyecto (accuracy).
 
-**Sin decidir todavía.** Antes de implementar, hace falta: (1) verificar el `num_ctx` real del modelo de generación en Ollama, y (2) decidir si el costo de CPU de un map-reduce completo es aceptable como job secundario, y bajo qué condiciones se le da prioridad frente a una transcripción nueva en curso (¿cola separada? ¿el mismo `transcription_semaphore`? ¿un semáforo propio de menor prioridad?).
+**Sin decidir todavía.** Antes de implementar, hace falta: (1) verificar el `num_ctx` real del modelo de generación en Ollama, y (2) decidir si el costo de CPU de un map-reduce completo es aceptable como job secundario, y bajo qué condiciones se le da prioridad frente a una transcripción nueva en curso (¿cola separada? ¿el mismo `heavy_compute_semaphore` que ya comparten Whisper y RAG, ver `docs/TODO.md`? ¿un semáforo propio de menor prioridad?).
 
 ## 2. Reproducir el audio de un segmento de baja confianza (`avg_logprob` bajo)
 
