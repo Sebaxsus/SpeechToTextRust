@@ -1,5 +1,7 @@
 pub mod audio_pipeline;
 mod handlers;
+mod mcp;
+mod rag;
 mod router;
 mod state;
 
@@ -18,7 +20,7 @@ async fn main() {
     // 1. Inicializamos nuestro estado compartido
     let estado = Arc::new(AppState {
         nombre_app: "Rust RAG Local-First".to_string(),
-        transcription_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+        heavy_compute_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         ollama,
         qdrant,
     });
@@ -29,6 +31,16 @@ async fn main() {
     // 3. Levantamos el servidor en el puerto 3000
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     println!("Servidor Axum corriendo en http://localhost:3000");
+    println!(
+        "Endpoint MCP (Streamable HTTP, Fase 6) en http://localhost:3000/mcp — probar con la \
+         extensión de HTTP requests de VSCode."
+    );
+    if std::env::var("MCP_BEARER_TOKEN").is_err() {
+        println!(
+            "MCP_BEARER_TOKEN no configurado: /mcp queda sin autenticación (ok solo para \
+             pruebas locales, ver CLAUDE.local.md: Fase 6)."
+        );
+    }
 
     axum::serve(listener, app).await.unwrap();
 }

@@ -17,6 +17,21 @@ uuid = { version = "1.23.1", features = ["v4", "v5"] }
 whisper-rs = "0.16.0"
 symphonia = { version = "0.6.0", features = ["all"] }
 rubato = "0.15"
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+candle-transformers = "0.11.0"
+hf-hub = "0.5.0"
+# `esaxx_fast` (default feature) compila una dependencia C++ (`esaxx-rs`) con runtime estático
+# (/MT), que en Windows/MSVC choca en link time (LNK2038) con el build CMake de
+# `whisper-rs-sys` (runtime dinámico, /MD). Ese feature solo acelera el *entrenamiento* de un
+# tokenizer Unigram/SentencePiece — acá solo cargamos un `tokenizer.json` ya entrenado, así que
+# desactivarlo no afecta la carga ni la tokenización en runtime.
+tokenizers = { version = "0.22.0", default-features = false, features = [
+  "onig",
+  "progressbar",
+] }
+rmcp = { version = "2.2.0", features = ["server", "macros", "transport-streamable-http-server", "schemars"] }
+schemars = "1"
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }

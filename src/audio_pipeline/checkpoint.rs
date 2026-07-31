@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::audio_pipeline::models::Checkpoint;
+use crate::audio_pipeline::util::write_atomic;
 
 pub struct CheckpointManager {
     checkpoint_path: PathBuf,
@@ -30,7 +31,7 @@ impl CheckpointManager {
             processed_seconds,
         };
         let json = serde_json::to_string_pretty(&checkpoint)?;
-        fs::write(&self.checkpoint_path, json)?;
+        write_atomic(&self.checkpoint_path, &json)?;
         Ok(())
     }
 }
