@@ -20,33 +20,8 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::audio_pipeline::models::JobMetadata;
-use crate::rag::{ChunkHit, SearchScope, rag_answer as ejecutar_rag_answer, search};
+use crate::rag::{SEARCH_TOP_K, ScopeArg, hit_to_json, rag_answer as ejecutar_rag_answer, search};
 use crate::state::SharedState;
-
-/// Top-k de `search_transcript`: más generoso que el `TOP_K = 6` de `rag::generation` porque acá
-/// el caller ve los chunks crudos (sin generación) y puede querer explorar más contexto.
-const SEARCH_TOP_K: u64 = 8;
-
-/// Scope de búsqueda expuesto a clientes MCP — refleja 1:1 `rag::retrieval::SearchScope` (ver
-/// CLAUDE.local.md: "Scope forzado explícitamente, sin default implícito a todo el corpus").
-/// Al serializar con `#[serde(tag = "scope")]` no existe ningún valor por omisión: el caller
-/// tiene que mandar `"scope": "audio"` + `"audio_id": "..."` o `"scope": "all_corpus"` de forma
-/// explícita — no hay un `audio_id: Option<String>` que pueda quedar en `None` por descuido.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(tag = "scope", rename_all = "snake_case")]
-pub enum ScopeArg {
-    Audio { audio_id: String },
-    AllCorpus,
-}
-
-impl From<ScopeArg> for SearchScope {
-    fn from(scope: ScopeArg) -> Self {
-        match scope {
-            ScopeArg::Audio { audio_id } => SearchScope::Audio(audio_id),
-            ScopeArg::AllCorpus => SearchScope::AllCorpus,
-        }
-    }
-}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SearchTranscriptRequest {
@@ -67,43 +42,15 @@ pub struct GetAudioMetadataRequest {
     pub audio_id: String,
 }
 
-fn hit_to_json(hit: &ChunkHit) -> serde_json::Value {
-    serde_json::json!({
-        "audio_id": hit.chunk.audio_id,
-        "chunk_id": hit.chunk.chunk_id,
-        "start": hit.chunk.start,
-        "end": hit.chunk.end,
-        "text": hit.chunk.text,
-        "speaker": hit.chunk.speaker,
-        "avg_logprob": hit.chunk.avg_logprob,
-        "score": hit.score,
-    })
-}
-
 fn error_interno(contexto: &str, err: anyhow::Error) -> McpError {
     eprintln!("Error MCP ({contexto}): {err:?}");
     McpError::internal_error(contexto.to_string(), None)
 }
 
-/// Enumera `./jobs/*` y delega en `audio_pipeline::job::load_job` (mismo loader validado que usa
-/// el endpoint de resume, ver `handlers::audio_handler::reanudar_job`) para leer cada `job.json`
-/// — un directorio sin `job.json` legible se saltea con un log en vez de abortar el listado
-/// completo. Los nombres de directorio ya son UUIDs generados por `create_job`, así que la
-/// validación de UUID de `load_job` nunca falla acá; se reusa igual para no duplicar el parseo.
+/// Delega en `audio_pipeline::job::list_jobs` (compartido con `GET /api/jobs`, ver
+/// `handlers::jobs_handler`) para no duplicar el `read_dir` + `load_job`.
 async fn listar_jobs() -> anyhow::Result<Vec<JobMetadata>> {
-    let mut entradas = tokio::fs::read_dir("./jobs").await?;
-    let mut jobs = Vec::new();
-    while let Some(entrada) = entradas.next_entry().await? {
-        if !entrada.file_type().await?.is_dir() {
-            continue;
-        }
-        let job_id = entrada.file_name().to_string_lossy().into_owned();
-        match crate::audio_pipeline::job::load_job(&job_id) {
-            Ok(metadata) => jobs.push(metadata),
-            Err(e) => eprintln!("No se pudo leer el job '{job_id}': {e}"),
-        }
-    }
-    Ok(jobs)
+    crate::audio_pipeline::job::list_jobs()
 }
 
 /// `audio_id` viene directo de un argumento de tool MCP (no confiable) — `load_job` valida que

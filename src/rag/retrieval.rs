@@ -15,6 +15,11 @@ use crate::audio_pipeline::embeddings::{COLLECTION_NAME, EMBEDDING_MODEL, determ
 /// CLAUDE.local.md: por eso el reranker está gateado a este scope, no a `Audio`).
 const RERANK_CANDIDATE_POOL: u64 = 30;
 
+/// Top-k para un retrieval "crudo" (sin generación): más generoso que el `TOP_K = 6` de
+/// `rag::generation` porque acá el caller ve los chunks tal cual y puede querer explorar más
+/// contexto. Compartido entre la tool MCP `search_transcript` y `POST /api/search`.
+pub const SEARCH_TOP_K: u64 = 8;
+
 /// Alcance de una búsqueda semántica — nunca un `audio_id: Option<String>` (ver
 /// CLAUDE.local.md: "Scope forzado, sin default implícito a todo el corpus"). El caller tiene
 /// que construir `AllCorpus` explícitamente para salir del audio seleccionado; no hay ningún
@@ -175,4 +180,42 @@ pub async fn search(
     });
 
     Ok(hits)
+}
+
+/// Scope de búsqueda tal como llega de un caller externo (tool MCP o `POST /api/search` /
+/// `POST /api/rag/answer`) — espejo 1:1 de `SearchScope`, deserializado con `#[serde(tag =
+/// "scope")]` para que no exista ningún valor por omisión: el caller manda `"scope":"audio"` +
+/// `"audio_id":"..."` o `"scope":"all_corpus"` de forma explícita, nunca un `audio_id:
+/// Option<String>` que pueda quedar en `None` por descuido (ver CLAUDE.local.md: "Scope forzado,
+/// sin default implícito a todo el corpus"). Compartido entre `src/mcp/mod.rs` y
+/// `src/handlers/rag_handler.rs` para no duplicar el schema.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum ScopeArg {
+    Audio { audio_id: String },
+    AllCorpus,
+}
+
+impl From<ScopeArg> for SearchScope {
+    fn from(scope: ScopeArg) -> Self {
+        match scope {
+            ScopeArg::Audio { audio_id } => SearchScope::Audio(audio_id),
+            ScopeArg::AllCorpus => SearchScope::AllCorpus,
+        }
+    }
+}
+
+/// Serialización compartida de un `ChunkHit` a JSON — usada tanto por la tool MCP
+/// `search_transcript` como por `POST /api/search`.
+pub fn hit_to_json(hit: &ChunkHit) -> serde_json::Value {
+    serde_json::json!({
+        "audio_id": hit.chunk.audio_id,
+        "chunk_id": hit.chunk.chunk_id,
+        "start": hit.chunk.start,
+        "end": hit.chunk.end,
+        "text": hit.chunk.text,
+        "speaker": hit.chunk.speaker,
+        "avg_logprob": hit.chunk.avg_logprob,
+        "score": hit.score,
+    })
 }
