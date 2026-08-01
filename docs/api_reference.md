@@ -26,6 +26,7 @@ No hay healthcheck (`GET /health` o similar) implementado todavía.
 | `GET` | `/api/jobs/{job_id}` | `jobs_handler::obtener_job_handler` | Sí | Status + progreso de un job puntual. |
 | `GET` | `/api/jobs/{job_id}/transcript` | `jobs_handler::obtener_transcript_handler` | Sí | Contenido de `transcript.jsonl`. |
 | `GET` | `/api/jobs/{job_id}/metrics` | `jobs_handler::obtener_metricas_handler` | Sí | Contenido de `metrics.jsonl` (tiempos + calidad por chunk). |
+| `GET` | `/api/jobs/{job_id}/audio-segment` | `jobs_handler::obtener_segmento_audio_handler` | Sí | Transcodea al vuelo un rango `[start,end]` del audio original a mp3. |
 | `POST` | `/api/search` | `rag_handler::buscar_handler` | Sí | Retrieval puro (equivalente REST de `search_transcript`). |
 | `POST` | `/api/rag/answer` | `rag_handler::rag_answer_handler` | Sí | Retrieval + generación (equivalente REST de `rag_answer`). |
 | `*` | `/mcp` | `mcp::build_service` (Streamable HTTP, `rmcp`) | Sí | Servidor MCP de solo lectura — ver sección propia. |
@@ -126,11 +127,13 @@ Lista todos los jobs — equivalente REST de la tool MCP `list_audios`. Reusa `a
       "created_at": "1753700000",
       "processing_started_at": "1753700005",
       "transcript_ready_at": null,
-      "completed_at": null
+      "completed_at": null,
+      "summary_status": "NotStarted",
+      "summary": null
     }
   ]
   ```
-  A diferencia de `list_audios`/`get_audio_metadata` de MCP, **no** incluye `audio_path`/`transcript_path`/`checkpoint_path` (rutas de disco del servidor) — filtrado desde el día uno para este endpoint. Sin paginación. `processing_started_at`/`transcript_ready_at`/`completed_at` (agregados 2026-07-31, epoch-segundos como string, `null` si esa fase todavía no ocurrió) permiten calcular cuánto tardó cada fase — ver `CLAUDE.local.md`: logger de métricas.
+  A diferencia de `list_audios`/`get_audio_metadata` de MCP, **no** incluye `audio_path`/`transcript_path`/`checkpoint_path` (rutas de disco del servidor) — filtrado desde el día uno para este endpoint. Sin paginación. `processing_started_at`/`transcript_ready_at`/`completed_at` (agregados 2026-07-31, epoch-segundos como string, `null` si esa fase todavía no ocurrió) permiten calcular cuánto tardó cada fase — ver `CLAUDE.local.md`: logger de métricas. `summary_status`/`summary` (agregados 2026-08-01): `summary_status` es uno de `NotStarted | Generating | Ready | Failed`; `summary` trae el texto del resumen solo cuando `summary_status == "Ready"`, `null` en cualquier otro caso — ver `CLAUDE.local.md`: "Resumen por audio".
 
 ### `GET /api/jobs/{job_id}`
 
@@ -154,6 +157,8 @@ Status y progreso de un job puntual.
     "processing_started_at": "1753700005",
     "transcript_ready_at": null,
     "completed_at": null,
+    "summary_status": "NotStarted",
+    "summary": null,
     "last_chunk": 4,
     "processed_seconds": 150.0
   }
@@ -177,10 +182,11 @@ Contenido de `transcript.jsonl`, leído en streaming (`BufReader::lines()`, nunc
     "status": "Processing",
     "transcript_ready": false,
     "entries": [
-      {"chunk": 0, "start": 0.0, "end": 30.0, "text": "...", "avg_logprob": -0.2}
+      {"chunk": 0, "start": 0.0, "end": 30.0, "text": "...", "avg_logprob": -0.2, "low_confidence": false}
     ]
   }
   ```
+  `low_confidence` (agregado 2026-08-01) es un campo calculado, no persistido en `transcript.jsonl` — `true` cuando `avg_logprob < LOW_CONFIDENCE_THOLD` (-0.6, ver `CLAUDE.local.md`). Se recalcula en cada lectura, así que cambiar el umbral no requiere reprocesar nada.
 
 ### `GET /api/jobs/{job_id}/metrics`
 
@@ -201,6 +207,28 @@ Contenido de `metrics.jsonl` (agregado 2026-07-31, ver `CLAUDE.local.md`: logger
   }
   ```
 - `score` es `exp(avg_logprob)` (confianza aproximada 0-1). `entropy` reproduce la fórmula interna de whisper.cpp (Shannon entropy sobre frecuencia de `token_id()`, no un proxy) — ver `CLAUDE.local.md` para el detalle de por qué es fiel a la fórmula real pero no a la ventana exacta de 32 tokens que usa whisper.cpp internamente.
+
+### `GET /api/jobs/{job_id}/audio-segment`
+
+Transcodea al vuelo con `ffmpeg` el rango `[start, end)` (segundos, query params) del audio **original** (no el PCM 16kHz que Whisper procesó) a mp3, streameado directo como body de la respuesta — agregado 2026-08-01, ver `CLAUDE.local.md`: "Reproducción de un segmento de audio". Pensado para que el cliente escuche un segmento marcado con `avg_logprob`/`low_confidence` bajo y verifique a oído si Whisper se equivocó.
+
+- Mismo criterio de `job_id`/`404` que los demás endpoints de job.
+- **Query params**: `start` y `end` (segundos, `f32`). Validación: `start >= 0`, `end > start`, `end - start <= 120` segundos.
+- **Respuestas**:
+
+  | Código | Cuándo | Body |
+  |---|---|---|
+  | `200 OK` | Rango válido. | Stream de audio, `Content-Type: audio/mpeg`. |
+  | `400 Bad Request` | `start`/`end` inválidos, o rango > 120s. | Texto plano describiendo el problema. |
+  | `404 Not Found` | `job_id` no es un UUID válido, o no existe el job. | Texto plano `"Job no encontrado"`. |
+  | `500 Internal Server Error` | No se pudo ejecutar `ffmpeg` (¿no está en el PATH?). | Texto plano. |
+
+- **Limitación conocida**: si `ffmpeg` falla a mitad de la transcodificación (input corrupto, rango fuera del audio real, etc.), el cliente ya recibió el header `200` — el audio llega truncado/corrupto en vez de un `500`, inherente a cualquier respuesta streaming. `ffmpeg` no pasa por `heavy_compute_semaphore` (carga de CPU corta, mismo criterio que el fallback de `ffmpeg` del decoder de Fase 2).
+
+```bash
+curl -i "http://localhost:3000/api/jobs/1b6f5e2a-4c3d-4a11-9e2b-0a1c2d3e4f5a/audio-segment?start=90&end=120" \
+  -H "Authorization: Bearer <token>" -o segmento.mp3
+```
 
 ### `POST /api/search`
 
@@ -230,9 +258,9 @@ Handshake estándar MCP: `initialize` → `notifications/initialized` → `tools
 
 ### Autenticación
 
-Middleware `exigir_bearer_token` (`router.rs`), aplicado a `/mcp` **y** a los endpoints REST de lectura de arriba (`GET /api/jobs`, `GET /api/jobs/{job_id}`, `GET /api/jobs/{job_id}/transcript`, `GET /api/jobs/{job_id}/metrics`, `POST /api/search`, `POST /api/rag/answer` — todos montados vía `router::crear_router_protegido`, mismo `route_layer`). `POST /api/upload-audio` y `POST /api/jobs/{job_id}/resume` (endpoints de escritura) quedan fuera de este grupo, sin autenticación, sin cambios.
+Middleware `exigir_bearer_token` (`router.rs`), aplicado a `/mcp` **y** a los endpoints REST de lectura de arriba (`GET /api/jobs`, `GET /api/jobs/{job_id}`, `GET /api/jobs/{job_id}/transcript`, `GET /api/jobs/{job_id}/metrics`, `GET /api/jobs/{job_id}/audio-segment`, `POST /api/search`, `POST /api/rag/answer` — todos montados vía `router::crear_router_protegido`, mismo `route_layer`). `POST /api/upload-audio` y `POST /api/jobs/{job_id}/resume` (endpoints de escritura) quedan fuera de este grupo, sin autenticación, sin cambios.
 
-- Si la variable de entorno `MCP_BEARER_TOKEN` está seteada: toda request a cualquiera de esas 7 rutas debe traer `Authorization: Bearer <token>` con el valor exacto, o responde `401 Unauthorized`.
+- Si la variable de entorno `MCP_BEARER_TOKEN` está seteada: toda request a cualquiera de esas 8 rutas debe traer `Authorization: Bearer <token>` con el valor exacto, o responde `401 Unauthorized`.
 - Si **no** está seteada: esas rutas quedan completamente sin autenticación (cualquiera que llegue a la IP:puerto puede llamarlas). Esto es aceptable solo mientras el servidor no se expone más allá de `localhost` — pero como se indicó arriba, el bind real hoy ya es `0.0.0.0`, así que en la práctica esto es un gap de seguridad activo, no solo teórico, en cuanto la máquina esté en una red no confiable.
 
 ### Tools disponibles
@@ -307,11 +335,16 @@ Sin parámetros. Enumera `./jobs/*`, lee cada `job.json` vía el mismo loader va
   "checkpoint_path": "./jobs/1b6f5e2a-.../checkpoint.json",
   "status": "Processing",
   "created_at": "1753700000",
-  "transcript_ready": false
+  "transcript_ready": false,
+  "processing_started_at": "1753700005",
+  "transcript_ready_at": null,
+  "completed_at": null,
+  "summary_status": "NotStarted"
 }
 ```
 
 - `status` es uno de `"Pending" | "Processing" | "Completed" | "Failed"` (enum `JobStatus`, `src/audio_pipeline/models.rs`) — actualizado en las transiciones reales del pipeline desde 2026-07-30 (ver `docs/TODO.md`). `Pending` mientras espera el permiso de `heavy_compute_semaphore`, `Processing` mientras corre activamente, `Completed`/`Failed` al terminar.
+- `summary_status` (agregado 2026-08-01) es uno de `"NotStarted" | "Generating" | "Ready" | "Failed"` — a diferencia de los endpoints REST (`JobSummary`), `list_audios`/`get_audio_metadata` de MCP **no** incluyen el texto del resumen en sí (`summary`), solo este bookkeeping — leerlo requeriría un campo adicional a agregar a las tools de MCP si hiciera falta a futuro.
 - `transcript_ready` (agregado 2026-07-30, `#[serde(default)] = false` para compatibilidad con `job.json` viejos sin el campo): `true` en cuanto Fase 2/3 (Whisper + persistencia) termina bien, independiente de si Fase 4 (embeddings) todavía está en curso o falla después.
 - `created_at` es un epoch en segundos, serializado como **string**, no número.
 - Los endpoints REST (`GET /api/jobs`, `GET /api/jobs/{job_id}`) devuelven un `JobSummary` filtrado (sin las 3 rutas de disco) en vez de este schema completo — ver sección propia más arriba. `list_audios`/`get_audio_metadata` de MCP siguen devolviendo el `JobMetadata` completo, con las rutas de disco sin filtrar (ver "Gaps conocidos").

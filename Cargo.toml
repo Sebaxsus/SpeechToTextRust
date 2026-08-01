@@ -34,6 +34,7 @@ rmcp = { version = "2.2.0", features = ["server", "macros", "transport-streamabl
 schemars = "1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt"] }
+tokio-util = { version = "0.7.18", features = ["io"] }
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
