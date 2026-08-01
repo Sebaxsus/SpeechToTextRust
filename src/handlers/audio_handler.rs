@@ -2,6 +2,8 @@ use crate::audio_pipeline::embeddings::run_embedding_phase;
 use crate::audio_pipeline::job::{create_job, load_job, update_job_metadata};
 use crate::audio_pipeline::models::{JobMetadata, JobStatus};
 use crate::audio_pipeline::pipeline::run_pipeline;
+use crate::audio_pipeline::util::now_epoch_string;
+use crate::router::UPLOAD_BODY_LIMIT_BYTES;
 use crate::state::SharedState;
 use axum::{
     extract::{Multipart, Path, State},
@@ -38,7 +40,7 @@ pub async fn recibir_y_procesar_audio(
     State(state): State<SharedState>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
-    println!("Recibiendo petición en la app: {}", state.nombre_app);
+    tracing::info!("Recibiendo petición en la app: {}", state.nombre_app);
 
     let Ok(Some(mut campo)) = multipart.next_field().await else {
         return (
@@ -69,7 +71,7 @@ pub async fn recibir_y_procesar_audio(
     let metadata = match create_job(extension) {
         Ok(metadata) => metadata,
         Err(e) => {
-            eprintln!("Error creando el job: {}", e);
+            tracing::error!("Error creando el job: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error interno del servidor",
@@ -81,7 +83,7 @@ pub async fn recibir_y_procesar_audio(
     let mut archivo_local = match tokio::fs::File::create(&metadata.audio_path).await {
         Ok(file) => file,
         Err(e) => {
-            eprintln!("Error al crear el archivo: {}", e);
+            tracing::error!("Error al crear el archivo: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error interno del servidor",
@@ -92,7 +94,7 @@ pub async fn recibir_y_procesar_audio(
 
     // Streaming directo al SSD para evitar Thrashing de la RAM.
     if let Err(e) = archivo_local.write_all(&primer_chunk).await {
-        eprintln!("Error escribiendo en disco: {}", e);
+        tracing::error!("Error escribiendo en disco: {}", e);
         let _ = tokio::fs::remove_dir_all(format!("./jobs/{}", metadata.job_id)).await;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -101,9 +103,32 @@ pub async fn recibir_y_procesar_audio(
             .into_response();
     }
 
-    while let Ok(Some(chunk)) = campo.chunk().await {
+    loop {
+        let chunk = match campo.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(e) => {
+                // Un error acá (body sobre el límite de tamaño, conexión cortada a mitad de la
+                // subida) NO es "fin del stream" — el `while let Ok(Some(chunk))` anterior lo
+                // trataba como tal, escribiendo un archivo truncado en disco y respondiendo 202
+                // igual. Ese archivo corrupto recién fallaba horas después, al decodificarlo en
+                // Fase 2, sin ningún indicio de que la subida nunca se completó.
+                tracing::error!("Error leyendo el archivo del multipart: {e}");
+                let _ = tokio::fs::remove_dir_all(format!("./jobs/{}", metadata.job_id)).await;
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Error leyendo el archivo subido (¿se cortó la conexión, o el archivo \
+                         supera el límite de {} MiB?)",
+                        UPLOAD_BODY_LIMIT_BYTES / 1024 / 1024
+                    ),
+                )
+                    .into_response();
+            }
+        };
+
         if let Err(e) = archivo_local.write_all(&chunk).await {
-            eprintln!("Error escribiendo en disco: {}", e);
+            tracing::error!("Error escribiendo en disco: {}", e);
             let _ = tokio::fs::remove_dir_all(format!("./jobs/{}", metadata.job_id)).await;
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -115,9 +140,10 @@ pub async fn recibir_y_procesar_audio(
 
     let job_id = metadata.job_id.clone();
 
-    println!(
+    tracing::info!(
         "Archivo {} guardado exitosamente en el SSD (job {}).",
-        nombre_archivo, job_id
+        nombre_archivo,
+        job_id
     );
 
     lanzar_procesamiento_job(state, metadata);
@@ -157,8 +183,11 @@ fn lanzar_procesamiento_job(state: SharedState, metadata: JobMetadata) {
         // heavy_compute_semaphore, su status queda en Pending (decisión explícita, ver
         // docs/TODO.md). Un fallo actualizando job.json se loguea pero nunca aborta el pipeline
         // real — es bookkeeping best-effort sobre trabajo que ya va a correr de todas formas.
-        if let Err(e) = update_job_metadata(&audio_id, |m| m.status = JobStatus::Processing) {
-            eprintln!("No se pudo marcar el job '{audio_id}' como Processing: {e}");
+        if let Err(e) = update_job_metadata(&audio_id, |m| {
+            m.status = JobStatus::Processing;
+            m.processing_started_at = Some(now_epoch_string());
+        }) {
+            tracing::error!("No se pudo marcar el job '{audio_id}' como Processing: {e}");
         }
 
         // Fase 2/3 (Whisper, CPU-bound) corre entera dentro de spawn_blocking y termina de
@@ -166,41 +195,51 @@ fn lanzar_procesamiento_job(state: SharedState, metadata: JobMetadata) {
         // se solapan Whisper y Ollama (ver CLAUDE.local.md: Concurrencia).
         match tokio::task::spawn_blocking(move || run_pipeline(metadata)).await {
             Ok(Err(e)) => {
-                eprintln!("Error en el pipeline: {}", e);
+                tracing::error!("Error en el pipeline: {}", e);
                 if let Err(e) = update_job_metadata(&audio_id, |m| m.status = JobStatus::Failed) {
-                    eprintln!("No se pudo marcar el job '{audio_id}' como Failed: {e}");
+                    tracing::error!("No se pudo marcar el job '{audio_id}' como Failed: {e}");
                 }
             }
             Err(e) => {
-                eprintln!("Error en el pipeline (join error): {}", e);
+                tracing::error!("Error en el pipeline (join error): {}", e);
                 if let Err(e) = update_job_metadata(&audio_id, |m| m.status = JobStatus::Failed) {
-                    eprintln!("No se pudo marcar el job '{audio_id}' como Failed: {e}");
+                    tracing::error!("No se pudo marcar el job '{audio_id}' como Failed: {e}");
                 }
             }
             Ok(Ok(())) => {
                 // transcript_ready refleja que Fase 2/3 terminó bien, independientemente de si
                 // Fase 4 (embeddings, abajo) todavía está en curso o falla — un cliente puede
                 // pedir el transcript aunque status todavía no sea Completed.
-                if let Err(e) = update_job_metadata(&audio_id, |m| m.transcript_ready = true) {
-                    eprintln!("No se pudo marcar transcript_ready para el job '{audio_id}': {e}");
+                if let Err(e) = update_job_metadata(&audio_id, |m| {
+                    m.transcript_ready = true;
+                    m.transcript_ready_at = Some(now_epoch_string());
+                }) {
+                    tracing::error!(
+                        "No se pudo marcar transcript_ready para el job '{audio_id}': {e}"
+                    );
                 }
 
                 match run_embedding_phase(&state.ollama, &state.qdrant, &audio_id, &transcript_path)
                     .await
                 {
                     Ok(()) => {
-                        if let Err(e) =
-                            update_job_metadata(&audio_id, |m| m.status = JobStatus::Completed)
-                        {
-                            eprintln!("No se pudo marcar el job '{audio_id}' como Completed: {e}");
+                        if let Err(e) = update_job_metadata(&audio_id, |m| {
+                            m.status = JobStatus::Completed;
+                            m.completed_at = Some(now_epoch_string());
+                        }) {
+                            tracing::error!(
+                                "No se pudo marcar el job '{audio_id}' como Completed: {e}"
+                            );
                         }
                     }
                     Err(e) => {
-                        eprintln!("Error en la fase de embeddings: {}", e);
+                        tracing::error!("Error en la fase de embeddings: {}", e);
                         if let Err(e) =
                             update_job_metadata(&audio_id, |m| m.status = JobStatus::Failed)
                         {
-                            eprintln!("No se pudo marcar el job '{audio_id}' como Failed: {e}");
+                            tracing::error!(
+                                "No se pudo marcar el job '{audio_id}' como Failed: {e}"
+                            );
                         }
                     }
                 }
@@ -223,7 +262,7 @@ pub async fn reanudar_job(
     let metadata = match load_job(&job_id) {
         Ok(metadata) => metadata,
         Err(e) => {
-            eprintln!("No se pudo reanudar el job '{job_id}': {e}");
+            tracing::error!("No se pudo reanudar el job '{job_id}': {e}");
             return (StatusCode::NOT_FOUND, "Job no encontrado").into_response();
         }
     };

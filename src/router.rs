@@ -4,13 +4,27 @@ use crate::mcp;
 use crate::state::SharedState;
 use axum::{
     Router,
-    extract::{Request, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::{StatusCode, header::AUTHORIZATION},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use std::sync::Arc;
+
+/// Límite explícito de tamaño de body para `POST /api/upload-audio` — el default de Axum
+/// (`DefaultBodyLimit`, 2 MiB) truncaba en silencio cualquier audio real de este proyecto (audios
+/// de varias horas, aunque el códec real sea AMR-NB de bajo bitrate, ~30MB para 5h — ver
+/// `CLAUDE.local.md`). 1 GiB deja margen cómodo incluso para el caso más pesado hoy soportado
+/// (`.wav` PCM sin comprimir, ~550MB para 5h a 16kHz mono) sin quedar sin límite. Esto NO implica
+/// bufferear el archivo en RAM: el handler sigue escribiendo a disco en streaming
+/// (`campo.chunk()` + `write_all` por chunk, ver `audio_handler.rs`) — el límite solo acota hasta
+/// dónde Axum deja leer el body antes de cortar la request, no cambia cómo se procesa. Scoped
+/// solo a esta ruta (no al router completo): las otras rutas con body (`POST /api/search`,
+/// `POST /api/rag/answer`, `/mcp`) usan `Json`/JSON-RPC, que sí bufferea el body entero en
+/// memoria para parsear — dejarlas en el límite default de 2 MiB evita que un body gigante ahí
+/// fuerce una asignación de RAM grande antes de fallar el parseo.
+pub(crate) const UPLOAD_BODY_LIMIT_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Token opcional para autenticar el endpoint `/mcp` (ver CLAUDE.local.md: "MCP de solo
 /// lectura" — "Bearer token en el endpoint MCP antes de bindear a la IP de LAN"). Leído una sola
@@ -46,9 +60,10 @@ async fn exigir_bearer_token(
 }
 
 /// Router de todo lo que requiere el bearer token de `/mcp` (`MCP_BEARER_TOKEN`): el propio
-/// `/mcp` y los 5 endpoints REST de lectura nuevos (`GET /api/jobs`, `GET /api/jobs/{job_id}`,
-/// `GET /api/jobs/{job_id}/transcript`, `POST /api/search`, `POST /api/rag/answer`) — todos
-/// exponen el mismo contenido transcrito sensible, así que comparten exactamente el mismo
+/// `/mcp` y los endpoints REST de lectura (`GET /api/jobs`, `GET /api/jobs/{job_id}`,
+/// `GET /api/jobs/{job_id}/transcript`, `GET /api/jobs/{job_id}/metrics`, `POST /api/search`,
+/// `POST /api/rag/answer`) — todos exponen el mismo contenido transcrito sensible, así que
+/// comparten exactamente el mismo
 /// middleware/token en vez de un segundo mecanismo de auth. `/api/upload-audio` y
 /// `/api/jobs/{id}/resume` (endpoints de escritura ya existentes) quedan fuera de este grupo, sin
 /// cambios.
@@ -71,6 +86,10 @@ fn crear_router_protegido(estado: SharedState) -> Router {
             "/api/jobs/{job_id}/transcript",
             get(jobs_handler::obtener_transcript_handler),
         )
+        .route(
+            "/api/jobs/{job_id}/metrics",
+            get(jobs_handler::obtener_metricas_handler),
+        )
         .route("/api/search", post(rag_handler::buscar_handler))
         .route("/api/rag/answer", post(rag_handler::rag_answer_handler))
         .with_state(estado)
@@ -81,10 +100,15 @@ fn crear_router_protegido(estado: SharedState) -> Router {
 }
 
 pub fn crear_router(estado: SharedState) -> Router {
-    Router::new()
+    let upload = Router::new()
         .route("/api/upload-audio", post(recibir_y_procesar_audio))
+        .layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT_BYTES))
+        .with_state(estado.clone());
+
+    Router::new()
         .route("/api/jobs/{job_id}/resume", post(reanudar_job))
         .with_state(estado.clone())
+        .merge(upload)
         .merge(crear_router_protegido(estado))
 }
 
@@ -275,6 +299,56 @@ mod tests {
             .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(json["transcript_ready"], false);
+        assert_eq!(json["entries"].as_array().unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(format!("./jobs/{}", metadata.job_id));
+    }
+
+    #[tokio::test]
+    async fn get_metrics_de_job_inexistente_devuelve_404() {
+        let app = crear_router(estado_de_prueba());
+        let job_id = uuid::Uuid::new_v4();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/jobs/{job_id}/metrics"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Mismo contrato que `get_transcript_de_job_recien_creado_devuelve_entries_vacio`: un job sin
+    /// `metrics.jsonl` en disco todavía responde `200` con `entries: []`, no `404`/`500`.
+    #[tokio::test]
+    async fn get_metrics_de_job_recien_creado_devuelve_entries_vacio() {
+        let _guard = crate::audio_pipeline::job::JOBS_DIR_TEST_LOCK.lock().await;
+
+        let metadata =
+            crate::audio_pipeline::job::create_job("wav").expect("no se pudo crear el job");
+        let app = crear_router(estado_de_prueba());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/jobs/{}/metrics", metadata.job_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(json["entries"].as_array().unwrap().len(), 0);
 
         let _ = std::fs::remove_dir_all(format!("./jobs/{}", metadata.job_id));

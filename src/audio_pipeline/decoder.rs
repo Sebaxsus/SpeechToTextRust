@@ -290,7 +290,7 @@ impl StreamingDecoder {
                 declared_rate,
             ),
             Err(symphonia_err) => {
-                eprintln!(
+                tracing::warn!(
                     "Symphonia no pudo decodificar {audio_path} ({symphonia_err}); \
                      usando ffmpeg como fallback (ver CLAUDE.local.md: códecs no soportados, \
                      ej. AMR-NB)."

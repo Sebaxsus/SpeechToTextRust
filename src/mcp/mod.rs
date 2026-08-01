@@ -43,7 +43,7 @@ pub struct GetAudioMetadataRequest {
 }
 
 fn error_interno(contexto: &str, err: anyhow::Error) -> McpError {
-    eprintln!("Error MCP ({contexto}): {err:?}");
+    tracing::error!("Error MCP ({contexto}): {err:?}");
     McpError::internal_error(contexto.to_string(), None)
 }
 

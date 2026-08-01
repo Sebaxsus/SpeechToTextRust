@@ -10,6 +10,7 @@ Estado actual de la superficie HTTP del servidor (`src/main.rs`, `src/router.rs`
 - Clientes construidos una sola vez en `main.rs` y compartidos vía `Arc<AppState>` (`src/state.rs`): `Ollama::default()` (`http://127.0.0.1:11434`) y `Qdrant::from_url("http://localhost:6334")`. Son clientes livianos (no cargan modelos) — construirlos al boot no viola la regla de "nunca dejar Whisper/Ollama residentes".
 - `heavy_compute_semaphore` (`Semaphore::new(1)`): como máximo una carga pesada de CPU/modelo a la vez en todo el proceso — compartido entre `POST /api/upload-audio`/`POST /api/jobs/{job_id}/resume` (Whisper) y las tools MCP `search_transcript`/`rag_answer` **y** sus equivalentes REST `POST /api/search`/`POST /api/rag/answer` (Ollama/reranker). Antes se llamaba `transcription_semaphore` y solo gateaba el pipeline de audio; se amplió (2026-07-29) tras detectar que las tools de RAG no tenían ningún gate de concurrencia propio.
 - Si `MCP_BEARER_TOKEN` no está seteado en el entorno, el proceso imprime una advertencia por consola al arrancar (no rechaza arrancar, no rechaza bindear a `0.0.0.0`) — ver "Autenticación" más abajo.
+- Logging (agregado 2026-07-31, ver `CLAUDE.local.md`): `cargo run -- --log` sube el nivel del logger centralizado (`tracing`) a `DEBUG`, mostrando las métricas por chunk del pipeline además de lo que ya se ve por defecto (arranque, warnings, errores). Sin el flag, el nivel es `INFO` — misma visibilidad que antes de migrar a `tracing`.
 
 No hay healthcheck (`GET /health` o similar) implementado todavía.
 
@@ -24,6 +25,7 @@ No hay healthcheck (`GET /health` o similar) implementado todavía.
 | `GET` | `/api/jobs` | `jobs_handler::listar_jobs_handler` | Sí | Lista todos los jobs (equivalente REST de `list_audios`). |
 | `GET` | `/api/jobs/{job_id}` | `jobs_handler::obtener_job_handler` | Sí | Status + progreso de un job puntual. |
 | `GET` | `/api/jobs/{job_id}/transcript` | `jobs_handler::obtener_transcript_handler` | Sí | Contenido de `transcript.jsonl`. |
+| `GET` | `/api/jobs/{job_id}/metrics` | `jobs_handler::obtener_metricas_handler` | Sí | Contenido de `metrics.jsonl` (tiempos + calidad por chunk). |
 | `POST` | `/api/search` | `rag_handler::buscar_handler` | Sí | Retrieval puro (equivalente REST de `search_transcript`). |
 | `POST` | `/api/rag/answer` | `rag_handler::rag_answer_handler` | Sí | Retrieval + generación (equivalente REST de `rag_answer`). |
 | `*` | `/mcp` | `mcp::build_service` (Streamable HTTP, `rmcp`) | Sí | Servidor MCP de solo lectura — ver sección propia. |
@@ -45,14 +47,14 @@ Sube un archivo de audio, crea un job nuevo (`job_id` UUID v4) y dispara el pipe
   - Caja ISO-BMFF `ftyp` en el offset 4 (`bytes[4..8] == "ftyp"`) → tratado como `mp4` (cubre también `.m4a`, mismo contenedor).
   - `RIFF....WAVE` en los primeros 12 bytes → tratado como `wav` (agregado 2026-07-30; Symphonia lo decodifica nativo, sin pasar por el fallback de ffmpeg).
   - Cualquier otra cosa → `400`, sin crear directorio de job ni escribir nada a disco.
-- No hay límite de tamaño de archivo explícito en el handler (Axum tiene un límite default de body, ver `DefaultBodyLimit` — no está configurado explícitamente en `router.rs`, así que corre con el default de Axum). El archivo se escribe a disco en streaming, chunk por chunk (`campo.chunk().await`), nunca se buferea completo en memoria.
+- Límite explícito de **1 GiB** (`router::UPLOAD_BODY_LIMIT_BYTES`, `DefaultBodyLimit::max(...)` aplicado solo a esta ruta, corregido 2026-07-31 — antes corría con el default de Axum, 2 MiB, que truncaba en silencio cualquier audio real de más de un par de minutos). El límite no implica bufferear en RAM: el archivo se sigue escribiendo a disco en streaming, chunk por chunk (`campo.chunk().await` + `write_all` por chunk), nunca se buferea completo en memoria — 1 GiB deja margen cómodo incluso para el caso más pesado hoy soportado (`.wav` PCM sin comprimir, ~550MB para 5h a 16kHz mono).
 
 ### Respuestas
 
 | Código | Cuándo | Body |
 |---|---|---|
 | `202 Accepted` | Archivo válido, guardado, pipeline lanzado en background. | `{"job_id": "<uuid>", "status": "processing"}` |
-| `400 Bad Request` | Multipart ilegible, campo vacío, o magic bytes no reconocidos (ni mp3, mp4 ni wav). | Texto plano (`"Error al leer el archivo multipart"` / `"Archivo vacío o inválido"` / `"Formato no soportado: solo se aceptan mp3, mp4/m4a y wav"`). |
+| `400 Bad Request` | Multipart ilegible, campo vacío, magic bytes no reconocidos (ni mp3, mp4 ni wav), o error leyendo el body a mitad de la subida (conexión cortada, o el archivo supera 1 GiB). | Texto plano (`"Error al leer el archivo multipart"` / `"Archivo vacío o inválido"` / `"Formato no soportado: solo se aceptan mp3, mp4/m4a y wav"` / `"Error leyendo el archivo subido (...)"`). En el último caso se limpia (`remove_dir_all`) el directorio del job a medio subir — antes de esta corrección (2026-07-31), un error acá se trataba como fin del stream y el archivo truncado se guardaba igual con `202`. |
 | `500 Internal Server Error` | Falla creando el directorio del job, creando el archivo en disco, o escribiendo un chunk. | Texto plano (`"Error interno del servidor"` / `"Error al guardar el archivo"`). Si falla escribiendo, se intenta limpiar (`remove_dir_all`) el directorio del job a medio crear. |
 
 `status: "processing"` en la respuesta es un valor fijo del handler, **no** refleja `job.json.status` — para el status real (`Pending`/`Processing`/`Completed`/`Failed`) usar `GET /api/jobs/{job_id}` (ver más abajo). No confundir uno con otro al construir el cliente.
@@ -121,11 +123,14 @@ Lista todos los jobs — equivalente REST de la tool MCP `list_audios`. Reusa `a
       "job_id": "1b6f5e2a-4c3d-4a11-9e2b-0a1c2d3e4f5a",
       "status": "Processing",
       "transcript_ready": false,
-      "created_at": "1753700000"
+      "created_at": "1753700000",
+      "processing_started_at": "1753700005",
+      "transcript_ready_at": null,
+      "completed_at": null
     }
   ]
   ```
-  A diferencia de `list_audios`/`get_audio_metadata` de MCP, **no** incluye `audio_path`/`transcript_path`/`checkpoint_path` (rutas de disco del servidor) — filtrado desde el día uno para este endpoint. Sin paginación.
+  A diferencia de `list_audios`/`get_audio_metadata` de MCP, **no** incluye `audio_path`/`transcript_path`/`checkpoint_path` (rutas de disco del servidor) — filtrado desde el día uno para este endpoint. Sin paginación. `processing_started_at`/`transcript_ready_at`/`completed_at` (agregados 2026-07-31, epoch-segundos como string, `null` si esa fase todavía no ocurrió) permiten calcular cuánto tardó cada fase — ver `CLAUDE.local.md`: logger de métricas.
 
 ### `GET /api/jobs/{job_id}`
 
@@ -146,6 +151,9 @@ Status y progreso de un job puntual.
     "status": "Processing",
     "transcript_ready": false,
     "created_at": "1753700000",
+    "processing_started_at": "1753700005",
+    "transcript_ready_at": null,
+    "completed_at": null,
     "last_chunk": 4,
     "processed_seconds": 150.0
   }
@@ -173,6 +181,26 @@ Contenido de `transcript.jsonl`, leído en streaming (`BufReader::lines()`, nunc
     ]
   }
   ```
+
+### `GET /api/jobs/{job_id}/metrics`
+
+Contenido de `metrics.jsonl` (agregado 2026-07-31, ver `CLAUDE.local.md`: logger de métricas) — tiempos por etapa y señales de calidad de whisper-rs por chunk, separado de `transcript.jsonl` a propósito (diagnóstico del pipeline, no contenido semántico). Leído en streaming igual que el endpoint anterior.
+
+- Mismo criterio de `job_id`/`404` que los demás endpoints de job. **Siempre `200` si el job existe**, `entries: []` si `metrics.jsonl` todavía no existe en disco (pipeline no arrancó a escribir, o corre una versión anterior a este cambio).
+- Ejemplo de body:
+  ```json
+  {
+    "entries": [
+      {
+        "chunk": 0, "start": 0.0, "end": 30.0,
+        "decode_ms": 12, "whisper_ms": 4300, "persist_ms": 1, "total_ms": 4313,
+        "text_len": 540, "avg_logprob": -0.42, "score": 0.66,
+        "no_speech_prob": 0.02, "entropy": 3.1, "segment_count": 4
+      }
+    ]
+  }
+  ```
+- `score` es `exp(avg_logprob)` (confianza aproximada 0-1). `entropy` reproduce la fórmula interna de whisper.cpp (Shannon entropy sobre frecuencia de `token_id()`, no un proxy) — ver `CLAUDE.local.md` para el detalle de por qué es fiel a la fórmula real pero no a la ventana exacta de 32 tokens que usa whisper.cpp internamente.
 
 ### `POST /api/search`
 
@@ -202,9 +230,9 @@ Handshake estándar MCP: `initialize` → `notifications/initialized` → `tools
 
 ### Autenticación
 
-Middleware `exigir_bearer_token` (`router.rs`), aplicado a `/mcp` **y** a los 5 endpoints REST de lectura de arriba (`GET /api/jobs`, `GET /api/jobs/{job_id}`, `GET /api/jobs/{job_id}/transcript`, `POST /api/search`, `POST /api/rag/answer` — todos montados vía `router::crear_router_protegido`, mismo `route_layer`). `POST /api/upload-audio` y `POST /api/jobs/{job_id}/resume` (endpoints de escritura) quedan fuera de este grupo, sin autenticación, sin cambios.
+Middleware `exigir_bearer_token` (`router.rs`), aplicado a `/mcp` **y** a los endpoints REST de lectura de arriba (`GET /api/jobs`, `GET /api/jobs/{job_id}`, `GET /api/jobs/{job_id}/transcript`, `GET /api/jobs/{job_id}/metrics`, `POST /api/search`, `POST /api/rag/answer` — todos montados vía `router::crear_router_protegido`, mismo `route_layer`). `POST /api/upload-audio` y `POST /api/jobs/{job_id}/resume` (endpoints de escritura) quedan fuera de este grupo, sin autenticación, sin cambios.
 
-- Si la variable de entorno `MCP_BEARER_TOKEN` está seteada: toda request a cualquiera de esas 6 rutas debe traer `Authorization: Bearer <token>` con el valor exacto, o responde `401 Unauthorized`.
+- Si la variable de entorno `MCP_BEARER_TOKEN` está seteada: toda request a cualquiera de esas 7 rutas debe traer `Authorization: Bearer <token>` con el valor exacto, o responde `401 Unauthorized`.
 - Si **no** está seteada: esas rutas quedan completamente sin autenticación (cualquiera que llegue a la IP:puerto puede llamarlas). Esto es aceptable solo mientras el servidor no se expone más allá de `localhost` — pero como se indicó arriba, el bind real hoy ya es `0.0.0.0`, así que en la práctica esto es un gap de seguridad activo, no solo teórico, en cuanto la máquina esté en una red no confiable.
 
 ### Tools disponibles
@@ -323,11 +351,11 @@ Extraído de `docs/TODO.md` y verificado contra el código actual — listado ac
 - **`list_audios`/`get_audio_metadata` de MCP exponen rutas de disco del servidor** (`audio_path`/`transcript_path`/`checkpoint_path`) sin filtrar. No es una fuga de secretos, pero es estructura interna innecesaria para un cliente remoto. Los endpoints REST equivalentes (`GET /api/jobs`, `GET /api/jobs/{job_id}`) ya filtran esos campos desde el día uno — este gap sigue existiendo solo en el lado MCP.
 - **Sin CORS configurado**: ni en `/mcp` ni en los endpoints REST nuevos — si el cliente web futuro los llama directo desde JS del browser (no a través de un backend propio), va a necesitar headers CORS (`Access-Control-Allow-Origin`, exponer `Mcp-Session-Id` para `/mcp`) que hoy no existen en el router.
 - **`allowed_hosts` de `rmcp` limitado a `localhost`/`127.0.0.1`/`::1`** (default del SDK, protección anti DNS-rebinding): un cliente conectando por la IP de LAN real recibe `403 Forbidden` hasta que se amplíe explícitamente con `.with_allowed_hosts([...])`. Solo afecta a `/mcp` (transporte `rmcp`), no a los endpoints `/api/*` (Axum plano, sin ese chequeo). Relevante ni bien se pruebe el servidor desde otro dispositivo en la misma red.
-- **Bearer token opcional, no obligatorio** — y el servidor ya bindea `0.0.0.0` (ver "Arranque del servidor"). Antes de probar desde otro dispositivo en la LAN, como mínimo setear `MCP_BEARER_TOKEN` (cubre `/mcp` y los 5 endpoints REST protegidos por igual, ver "Autenticación").
+- **Bearer token opcional, no obligatorio** — y el servidor ya bindea `0.0.0.0` (ver "Arranque del servidor"). Antes de probar desde otro dispositivo en la LAN, como mínimo setear `MCP_BEARER_TOKEN` (cubre `/mcp` y los endpoints REST protegidos por igual, ver "Autenticación").
 - **"Jobs atascados"**: si el proceso completo del servidor muere a mitad de una transcripción (no un `Err` capturado dentro de Rust, sino el binario cayendo), ningún código marca el job como `Failed` — queda en `Processing` indefinidamente. Detectar esto por `mtime` de `checkpoint.json` está documentado como enfoque en `docs/TODO.md`, sin umbral fijado ni implementado todavía.
 - **`job.json` no tiene ningún campo "amigable" para UI** (nombre de archivo original, título): un selector de audios en el cliente web va a mostrar UUIDs pelados hasta que se agregue.
 - **Sin `CancellationToken`/graceful shutdown** para las sesiones MCP — matar el proceso no las cierra prolijamente; no bloquea testing manual pero puede dar falsos timeouts en un cliente si el proceso se reinicia con una sesión abierta.
-- **`POST /api/upload-audio` no tiene límite de tamaño de archivo explícito** — corre con el `DefaultBodyLimit` de Axum, no configurado a mano en `router.rs`. Verificar el valor default de la versión de Axum en uso (0.8.9) antes de probar con audios de varias horas/GB, o subirlo explícitamente si hace falta.
+- ~~`POST /api/upload-audio` no tiene límite de tamaño de archivo explícito~~ — **resuelto 2026-07-31**: límite explícito de 1 GiB, scoped solo a esta ruta (ver sección propia más arriba). Encontrado como bug real, no solo teórico: el default de Axum (2 MiB) truncaba en silencio audios de más de un par de minutos, y el handler trataba el error de lectura resultante como fin del stream normal en vez de reportarlo — el archivo truncado se guardaba con `202 Accepted` como si la subida hubiera sido exitosa, y solo fallaba horas después al decodificarlo en Fase 2 (`Symphonia`/`ffprobe`: "missing moov atom" / "Invalid data found"). Ambos bugs corregidos juntos.
 - **`POST /api/rag/answer` (REST y MCP) sin timeout de request ni streaming**: una generación con el modelo de 7-8B en CPU puede tardar bastante; no hay número medido documentado ni mitigación implementada.
 
 ## Cómo probar el estado actual

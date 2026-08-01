@@ -1,8 +1,8 @@
 //! Endpoints REST de solo lectura sobre jobs (`GET /api/jobs`, `GET /api/jobs/{job_id}`,
-//! `GET /api/jobs/{job_id}/transcript`) — wrappers finos sobre `audio_pipeline::job`, pensados
-//! para que un cliente web no tenga que hablar el protocolo MCP completo solo para leer estado.
-//! Montados bajo el mismo middleware de bearer token que `/mcp` (ver `router.rs`), porque
-//! exponen el mismo contenido transcrito sensible.
+//! `GET /api/jobs/{job_id}/transcript`, `GET /api/jobs/{job_id}/metrics`) — wrappers finos sobre
+//! `audio_pipeline::job`, pensados para que un cliente web no tenga que hablar el protocolo MCP
+//! completo solo para leer estado. Montados bajo el mismo middleware de bearer token que `/mcp`
+//! (ver `router.rs`), porque exponen el mismo contenido transcrito sensible.
 
 use std::io::{BufRead, BufReader};
 
@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::audio_pipeline::checkpoint::CheckpointManager;
 use crate::audio_pipeline::job::{list_jobs, load_job};
-use crate::audio_pipeline::models::{JobMetadata, JobStatus, TranscriptEntry};
+use crate::audio_pipeline::models::{ChunkMetrics, JobMetadata, JobStatus, TranscriptEntry};
 
 /// Subconjunto público de `JobMetadata` — nunca expone `audio_path`/`transcript_path`/
 /// `checkpoint_path` (rutas de disco del servidor, estructura interna que un cliente remoto no
@@ -22,6 +22,13 @@ pub struct JobSummary {
     pub status: JobStatus,
     pub transcript_ready: bool,
     pub created_at: String,
+    /// Timestamps de fase (epoch-segundos, `None` si esa fase todavía no ocurrió) — permiten
+    /// calcular "tiempo de ejecución entre tareas": duración Whisper =
+    /// `transcript_ready_at - processing_started_at`; duración embeddings = `completed_at -
+    /// transcript_ready_at` (ver CLAUDE.local.md: logger de métricas).
+    pub processing_started_at: Option<String>,
+    pub transcript_ready_at: Option<String>,
+    pub completed_at: Option<String>,
 }
 
 impl From<&JobMetadata> for JobSummary {
@@ -31,6 +38,9 @@ impl From<&JobMetadata> for JobSummary {
             status: metadata.status,
             transcript_ready: metadata.transcript_ready,
             created_at: metadata.created_at.clone(),
+            processing_started_at: metadata.processing_started_at.clone(),
+            transcript_ready_at: metadata.transcript_ready_at.clone(),
+            completed_at: metadata.completed_at.clone(),
         }
     }
 }
@@ -44,7 +54,7 @@ pub async fn listar_jobs_handler() -> impl IntoResponse {
             Json(resumen).into_response()
         }
         Err(e) => {
-            eprintln!("Error listando jobs: {e}");
+            tracing::error!("Error listando jobs: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error interno del servidor",
@@ -72,7 +82,7 @@ pub async fn obtener_job_handler(Path(job_id): Path<String>) -> impl IntoRespons
     let metadata = match load_job(&job_id) {
         Ok(metadata) => metadata,
         Err(e) => {
-            eprintln!("No se pudo leer el job '{job_id}': {e}");
+            tracing::error!("No se pudo leer el job '{job_id}': {e}");
             return (StatusCode::NOT_FOUND, "Job no encontrado").into_response();
         }
     };
@@ -83,7 +93,7 @@ pub async fn obtener_job_handler(Path(job_id): Path<String>) -> impl IntoRespons
         match CheckpointManager::new(&metadata.checkpoint_path).and_then(|mut cm| cm.load()) {
             Ok(cp) => cp,
             Err(e) => {
-                eprintln!("No se pudo leer el checkpoint del job '{job_id}': {e}");
+                tracing::error!("No se pudo leer el checkpoint del job '{job_id}': {e}");
                 Default::default()
             }
         };
@@ -113,16 +123,16 @@ pub async fn obtener_transcript_handler(Path(job_id): Path<String>) -> impl Into
     let metadata = match load_job(&job_id) {
         Ok(metadata) => metadata,
         Err(e) => {
-            eprintln!("No se pudo leer el job '{job_id}': {e}");
+            tracing::error!("No se pudo leer el job '{job_id}': {e}");
             return (StatusCode::NOT_FOUND, "Job no encontrado").into_response();
         }
     };
 
     let entries = if std::path::Path::new(&metadata.transcript_path).exists() {
-        match leer_transcript_entries(&metadata.transcript_path) {
+        match leer_jsonl_entries::<TranscriptEntry>(&metadata.transcript_path) {
             Ok(entries) => entries,
             Err(e) => {
-                eprintln!("No se pudo leer el transcript del job '{job_id}': {e}");
+                tracing::error!("No se pudo leer el transcript del job '{job_id}': {e}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Error interno del servidor",
@@ -142,11 +152,49 @@ pub async fn obtener_transcript_handler(Path(job_id): Path<String>) -> impl Into
     .into_response()
 }
 
-/// Lee `transcript.jsonl` línea por línea (streaming, `BufReader::lines()`, nunca
-/// `fs::read_to_string` completo — mismo estilo que `embeddings.rs::run_embedding_phase`) y arma
-/// el `Vec<TranscriptEntry>` de la respuesta.
-fn leer_transcript_entries(transcript_path: &str) -> anyhow::Result<Vec<TranscriptEntry>> {
-    let file = std::fs::File::open(transcript_path)?;
+#[derive(Debug, Serialize)]
+pub struct MetricsResponse {
+    pub entries: Vec<ChunkMetrics>,
+}
+
+/// `GET /api/jobs/{job_id}/metrics` — contenido de `metrics.jsonl` (tiempos por etapa + señales
+/// de calidad de whisper-rs por chunk, ver `CLAUDE.local.md`: logger de métricas). Mismo criterio
+/// que `obtener_transcript_handler`: `404` solo si el job no existe/UUID inválido, `200` con
+/// `entries: []` si el pipeline todavía no escribió ningún chunk.
+pub async fn obtener_metricas_handler(Path(job_id): Path<String>) -> impl IntoResponse {
+    let metadata = match load_job(&job_id) {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            tracing::error!("No se pudo leer el job '{job_id}': {e}");
+            return (StatusCode::NOT_FOUND, "Job no encontrado").into_response();
+        }
+    };
+
+    let metrics_path = metadata.metrics_path();
+    let entries = if metrics_path.exists() {
+        match leer_jsonl_entries::<ChunkMetrics>(&metrics_path.to_string_lossy()) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::error!("No se pudo leer las métricas del job '{job_id}': {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Error interno del servidor",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    Json(MetricsResponse { entries }).into_response()
+}
+
+/// Lee un `.jsonl` línea por línea (streaming, `BufReader::lines()`, nunca `fs::read_to_string`
+/// completo — mismo estilo que `embeddings.rs::run_embedding_phase`). Genérico sobre `T` para
+/// reusarlo entre `transcript.jsonl` (`TranscriptEntry`) y `metrics.jsonl` (`ChunkMetrics`).
+fn leer_jsonl_entries<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<Vec<T>> {
+    let file = std::fs::File::open(path)?;
     let mut entries = Vec::new();
     for line in BufReader::new(file).lines() {
         let line = line?;

@@ -1,12 +1,11 @@
 use std::fs;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use uuid::Uuid;
 
 use crate::audio_pipeline::models::{JobMetadata, JobStatus};
-use crate::audio_pipeline::util::write_atomic;
+use crate::audio_pipeline::util::{now_epoch_string, write_atomic};
 
 /// Serializa el read-modify-write de `update_job_metadata` frente a cualquier otra llamada
 /// concurrente (mismo `job_id` o distinto). `write_atomic` (tmp + rename) ya evita que un lector
@@ -36,20 +35,17 @@ pub fn create_job(extension: &str) -> anyhow::Result<JobMetadata> {
     let transcript_path = job_dir.join("transcript.jsonl");
     let checkpoint_path = job_dir.join("checkpoint.json");
 
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string();
-
     let metadata = JobMetadata {
         job_id,
         audio_path: audio_path.to_string_lossy().into_owned(),
         transcript_path: transcript_path.to_string_lossy().into_owned(),
         checkpoint_path: checkpoint_path.to_string_lossy().into_owned(),
         status: JobStatus::Pending,
-        created_at,
+        created_at: now_epoch_string(),
         transcript_ready: false,
+        processing_started_at: None,
+        transcript_ready_at: None,
+        completed_at: None,
     };
 
     let job_json_path = job_dir.join("job.json");
@@ -114,7 +110,7 @@ pub fn list_jobs() -> anyhow::Result<Vec<JobMetadata>> {
         let job_id = entrada.file_name().to_string_lossy().into_owned();
         match load_job(&job_id) {
             Ok(metadata) => jobs.push(metadata),
-            Err(e) => eprintln!("No se pudo leer el job '{job_id}': {e}"),
+            Err(e) => tracing::warn!("No se pudo leer el job '{job_id}': {e}"),
         }
     }
     Ok(jobs)

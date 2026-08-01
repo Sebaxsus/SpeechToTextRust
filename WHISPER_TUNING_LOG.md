@@ -1,0 +1,11 @@
+# Whisper tuning log
+
+Changelog de cambios a `FullParams` en `src/audio_pipeline/whisper_runner.rs` — qué se cambió, por qué, y sobre qué audio se probó. No es un documento de diseño; para el razonamiento completo ver `CLAUDE.local.md`.
+
+## 2026-07-31
+
+- Changed: `suppress_nst` `false` -> `true`
+- Changed: `initial_prompt` (sin setear) -> `"Transcripción de una reunión de trabajo en español, conversación natural."`
+- Why: en tramos de silencio/ruido de fondo (típico del final de una reunión grabada con teléfono), Whisper entraba en un loop de alucinación repitiendo literalmente `(Portuguesa)`, `(Para el video de la cámara)`, `(Murmullos)` — caption tags aprendidos de datos de entrenamiento, no traducción real. `avg_logprob` en esos chunks era alto (ej. `-0.07`), así que el gate `no_speech_thold`+`logprob_thold` nunca se disparaba. Se verificó en el código fuente vendorizado de whisper.cpp (`whisper-rs-sys` 0.15.0, `whisper.cpp:6095-6100`) que la lista `non_speech_tokens` que `suppress_nst` suprime incluye literalmente `"("` y `")"` — es un fix quirúrgico para este bug específico (bloquea el token que abre esas frases), no una mejora genérica. `initial_prompt` se agrega como sesgo adicional de idioma/registro (frase genérica, sin vocabulario de un dominio específico, para que sirva en cualquier audio futuro).
+- No changed (evaluado y diferido): `SamplingStrategy` se mantiene `Greedy { best_of: 1 }`. BeamSearch se consideró (mejora esperada en precisión) pero se descartó para esta sesión: con `Greedy` ya se mide ~60% de CPU en un Ryzen 5 5600x para un audio de 22 min, y el costo de BeamSearch (~3-5x más lento por chunk) es un riesgo real de throughput/thermal throttling en audios de 5h. Queda como opción futura a evaluar aparte.
+- Tested on: hallazgo verificado sobre el transcript ya generado del job `6be8a34c-2619-486d-ae29-98e0c6a028c8` (reunión de planificación de obra/construcción, grabación de teléfono, tramos de silencio al final). Verificación de que el fix reduce/elimina el loop de alucinación: **pendiente** — falta re-correr un audio real (mismo job u otro con silencio similar al final) con el binario actualizado y comparar el `transcript.jsonl` resultante.
