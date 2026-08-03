@@ -84,6 +84,11 @@ pub async fn rag_answer(
         .keep_alive(KeepAlive::UnloadOnCompletion);
 
     let response = ollama.send_chat_messages(request).await?;
+    tracing::debug!(
+        hits = hits.len(),
+        response_chars = response.message.content.len(),
+        "Ollama devolvió la respuesta de rag_answer"
+    );
 
     Ok(response.message.content)
 }

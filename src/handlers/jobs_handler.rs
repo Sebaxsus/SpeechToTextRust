@@ -131,6 +131,8 @@ pub async fn obtener_job_handler(Path(job_id): Path<String>) -> impl IntoRespons
             }
         };
 
+    tracing::info!(target: "lifecycle", job_id = %job_id, "Enviando el estado del job");
+
     Json(JobStatusResponse {
         summary: JobSummary::from(&metadata),
         last_chunk: checkpoint.last_chunk,

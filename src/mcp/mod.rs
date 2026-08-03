@@ -203,9 +203,11 @@ impl ServerHandler for RagServer {
 /// son livianos (no cargan modelos), así que esto no viola la regla de "nunca dejar Whisper/Ollama
 /// residentes" (ver CLAUDE.local.md).
 pub fn build_service(state: SharedState) -> StreamableHttpService<RagServer, LocalSessionManager> {
+    let config = StreamableHttpServerConfig::default()
+        .with_cancellation_token(state.mcp_cancellation_token.clone());
     StreamableHttpService::new(
         move || Ok(RagServer::new(state.clone())),
         Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
+        config,
     )
 }

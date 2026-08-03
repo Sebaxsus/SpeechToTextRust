@@ -141,12 +141,13 @@ pub async fn recibir_y_procesar_audio(
     let job_id = metadata.job_id.clone();
 
     tracing::info!(
+        target: "lifecycle",
         "Archivo {} guardado exitosamente en el SSD (job {}).",
         nombre_archivo,
         job_id
     );
 
-    lanzar_procesamiento_job(state, metadata);
+    lanzar_procesamiento_job(state, metadata, false);
 
     (
         StatusCode::ACCEPTED,
@@ -160,11 +161,12 @@ pub async fn recibir_y_procesar_audio(
 
 /// Corre Fase 2/3 (Whisper) y, si termina bien, encadena Fase 4 (embeddings) — la misma cadena
 /// tanto para un job recién creado (`recibir_y_procesar_audio`) como para uno reanudado
-/// (`reanudar_job`). No hace falta distinguir "nuevo" de "reanudado" acá: `run_pipeline` ya es
-/// resume-safe por sí mismo (lee `checkpoint.json` y retoma donde cortó — ver `pipeline.rs`), y
-/// `run_embedding_phase` es idempotente (point ID determinístico), así que reintentar Fase 4
-/// sobre un transcript ya embebido tampoco duplica vectores.
-fn lanzar_procesamiento_job(state: SharedState, metadata: JobMetadata) {
+/// (`reanudar_job`). No hace falta distinguir "nuevo" de "reanudado" para la lógica del pipeline:
+/// `run_pipeline` ya es resume-safe por sí mismo (lee `checkpoint.json` y retoma donde cortó — ver
+/// `pipeline.rs`), y `run_embedding_phase` es idempotente (point ID determinístico), así que
+/// reintentar Fase 4 sobre un transcript ya embebido tampoco duplica vectores. `es_resume` solo
+/// existe para que el log de `lifecycle` diga "transcribiendo" o "resumiendo" según corresponda.
+fn lanzar_procesamiento_job(state: SharedState, metadata: JobMetadata, es_resume: bool) {
     tokio::spawn(async move {
         let permit = state
             .heavy_compute_semaphore
@@ -177,6 +179,12 @@ fn lanzar_procesamiento_job(state: SharedState, metadata: JobMetadata) {
 
         let audio_id = metadata.job_id.clone();
         let transcript_path = metadata.transcript_path.clone();
+
+        if es_resume {
+            tracing::info!(target: "lifecycle", job_id = %audio_id, "Resumiendo la transcripción del job");
+        } else {
+            tracing::info!(target: "lifecycle", job_id = %audio_id, "Transcribiendo el job");
+        }
 
         // "Processing" se marca acá, recién con el permiso ya adquirido: significa "corriendo
         // activamente", no "encolado". Mientras un job espera detrás de otro job pesado en
@@ -219,6 +227,7 @@ fn lanzar_procesamiento_job(state: SharedState, metadata: JobMetadata) {
                     );
                 }
 
+                tracing::info!(target: "lifecycle", job_id = %audio_id, "Generando embeddings del job");
                 match run_embedding_phase(&state.ollama, &state.qdrant, &audio_id, &transcript_path)
                     .await
                 {
@@ -289,10 +298,12 @@ fn lanzar_generacion_resumen(state: SharedState, audio_id: String) {
             tracing::error!("No se pudo marcar el job '{audio_id}' como Generating (resumen): {e}");
         }
 
+        tracing::info!(target: "lifecycle", job_id = %audio_id, "Generando el resumen del job");
         match crate::rag::generate_summary(&state.ollama, &metadata.transcript_path).await {
             Ok(texto) => {
                 let persistido = write_atomic(&metadata.summary_path(), &texto);
                 let nuevo_status = if persistido.is_ok() {
+                    tracing::info!(target: "lifecycle", job_id = %audio_id, "Resumen del job listo");
                     SummaryStatus::Ready
                 } else {
                     if let Err(e) = persistido {
@@ -342,7 +353,7 @@ pub async fn reanudar_job(
         }
     };
 
-    lanzar_procesamiento_job(state, metadata);
+    lanzar_procesamiento_job(state, metadata, true);
 
     (
         StatusCode::ACCEPTED,

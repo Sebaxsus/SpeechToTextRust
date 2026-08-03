@@ -102,6 +102,11 @@ async fn summarize_batch(
     }
 
     let response = ollama.send_chat_messages(request).await?;
+    tracing::debug!(
+        batch_chars = batch_text.len(),
+        response_chars = response.message.content.len(),
+        "Ollama devolvió el resumen del lote"
+    );
     Ok(response.message.content)
 }
 
@@ -130,6 +135,11 @@ async fn consolidate_summaries(
     .keep_alive(KeepAlive::UnloadOnCompletion);
 
     let response = ollama.send_chat_messages(request).await?;
+    tracing::debug!(
+        lotes = batch_summaries.len(),
+        response_chars = response.message.content.len(),
+        "Ollama devolvió la consolidación final del resumen"
+    );
     Ok(response.message.content)
 }
 

@@ -2,6 +2,7 @@ use ollama_rs::Ollama;
 use qdrant_client::Qdrant;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 pub struct AppState {
     pub nombre_app: String,
@@ -16,6 +17,11 @@ pub struct AppState {
     pub ollama: Ollama,
     // Qdrant nunca se expone en la LAN — solo bindeado a localhost (ver CLAUDE.local.md).
     pub qdrant: Qdrant,
+    // Cancela las sesiones MCP abiertas (`StreamableHttpServerConfig::cancellation_token`, ver
+    // `mcp::build_service`) al recibir CTRL+C — sin esto, `LocalSessionManager` no se entera del
+    // shutdown y las sesiones quedan "abiertas" del lado del servidor hasta que el proceso muere
+    // (ver docs/TODO.md: "Sin CancellationToken propio ni graceful shutdown").
+    pub mcp_cancellation_token: CancellationToken,
 }
 
 pub type SharedState = Arc<AppState>;

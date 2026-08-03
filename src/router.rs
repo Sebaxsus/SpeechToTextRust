@@ -134,6 +134,7 @@ mod tests {
             qdrant: qdrant_client::Qdrant::from_url("http://localhost:6334")
                 .build()
                 .expect("cliente de Qdrant de prueba"),
+            mcp_cancellation_token: tokio_util::sync::CancellationToken::new(),
         })
     }
 
