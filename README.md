@@ -117,7 +117,7 @@ Verificar: `ffmpeg -version` y `ffprobe -version` deben correr desde cualquier t
 
 ### 3. Modelo de Whisper (GGML)
 
-Descargar `ggml-small-q5_1.bin` (cuantización oficial de whisper.cpp) y colocarlo en `./models/ggml-small-q5_1.bin` desde la raíz del proyecto.
+Descargar `ggml-small-q5_1.bin` (cuantización oficial de whisper.cpp) y colocarlo en `./models/ggml-small-q5_1.bin` desde la raíz del proyecto. Ruta configurable vía `WHISPER_MODEL_PATH` en `.env` si preferís otra ubicación u otro modelo (ver [`docs/configuracion.md`](docs/configuracion.md)).
 
 ### 4. Ollama
 
@@ -144,7 +144,8 @@ docker run -d --name qdrant_local \
 Verificar: `curl http://127.0.0.1:6333/collections` debe responder `200`.
 
 Para revisar/administrar la instancia ya corriendo (dashboard web, ver los vectores guardados,
-entender qué significa cada campo) ver [`docs/qdrant.md`](docs/qdrant.md).
+entender qué significa cada campo) ver [`docs/qdrant.md`](docs/qdrant.md). URL configurable vía
+`QDRANT_URL` en `.env` si corre en otro host/puerto.
 
 ### 6. Reranker (candle + Hugging Face Hub)
 
@@ -166,7 +167,7 @@ Editá solo lo que necesites — sin `.env`, o con una variable comentada, el co
 cargo run
 ```
 
-Levanta el servidor en `http://localhost:3000`. Endpoint principal:
+Levanta el servidor en `http://localhost:3000` por default (dirección/puerto configurables vía `SERVER_BIND_ADDR` en `.env`). Endpoint principal:
 
 ```
 POST /api/upload-audio   (multipart/form-data, campo de archivo mp3/mp4)
