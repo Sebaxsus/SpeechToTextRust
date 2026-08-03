@@ -7,18 +7,8 @@ use qdrant_client::{Payload, Qdrant};
 use serde::Deserialize;
 
 use super::reranker;
-use crate::audio_pipeline::embeddings::{COLLECTION_NAME, EMBEDDING_MODEL, deterministic_point_id};
-
-/// Cuando `scope = AllCorpus`, el bi-encoder trae este pool de candidatos (en vez de solo
-/// `top_k`) para que el cross-encoder tenga margen real de reordenar antes de recortar a
-/// `top_k` — rerankear un puñado de 6 hits ya casi-óptimos del coseno no vale la pena (ver
-/// CLAUDE.local.md: por eso el reranker está gateado a este scope, no a `Audio`).
-const RERANK_CANDIDATE_POOL: u64 = 30;
-
-/// Top-k para un retrieval "crudo" (sin generación): más generoso que el `TOP_K = 6` de
-/// `rag::generation` porque acá el caller ve los chunks tal cual y puede querer explorar más
-/// contexto. Compartido entre la tool MCP `search_transcript` y `POST /api/search`.
-pub const SEARCH_TOP_K: u64 = 8;
+use crate::audio_pipeline::embeddings::{COLLECTION_NAME, deterministic_point_id};
+use crate::config::RagConfig;
 
 /// Alcance de una búsqueda semántica — nunca un `audio_id: Option<String>` (ver
 /// CLAUDE.local.md: "Scope forzado, sin default implícito a todo el corpus"). El caller tiene
@@ -67,9 +57,13 @@ pub struct ChunkHit {
     pub score: Option<f32>,
 }
 
-async fn embed_query(ollama: &Ollama, query: &str) -> anyhow::Result<Vec<f32>> {
+async fn embed_query(
+    ollama: &Ollama,
+    query: &str,
+    embedding_model: &str,
+) -> anyhow::Result<Vec<f32>> {
     let request = GenerateEmbeddingsRequest::new(
-        EMBEDDING_MODEL.to_string(),
+        embedding_model.to_string(),
         EmbeddingsInput::Single(query.to_string()),
     );
     let response = ollama.generate_embeddings(request).await?;
@@ -100,13 +94,14 @@ pub async fn search(
     query: &str,
     scope: &SearchScope,
     top_k: u64,
+    rag: &RagConfig,
 ) -> anyhow::Result<Vec<ChunkHit>> {
-    let query_vector = embed_query(ollama, query).await?;
+    let query_vector = embed_query(ollama, query, &rag.embedding_model).await?;
 
     // Con AllCorpus traemos más candidatos de los que finalmente se usan, para darle al
-    // reranker un pool real sobre el que reordenar (ver `RERANK_CANDIDATE_POOL`).
+    // reranker un pool real sobre el que reordenar (ver `RagConfig::rerank_candidate_pool`).
     let fetch_k = match scope {
-        SearchScope::AllCorpus => top_k.max(RERANK_CANDIDATE_POOL),
+        SearchScope::AllCorpus => top_k.max(rag.rerank_candidate_pool),
         SearchScope::Audio(_) => top_k,
     };
 
@@ -136,7 +131,8 @@ pub async fn search(
     }
 
     let mut hits = if *scope == SearchScope::AllCorpus {
-        let mut reranked = reranker::rerank(query, hits).await;
+        let mut reranked =
+            reranker::rerank(query, hits, &rag.reranker_model_id, &rag.reranker_revision).await;
         reranked.truncate(top_k as usize);
         reranked
     } else {

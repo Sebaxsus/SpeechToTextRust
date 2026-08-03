@@ -150,6 +150,16 @@ entender qué significa cada campo) ver [`docs/qdrant.md`](docs/qdrant.md).
 
 No requiere instalación manual: la primera vez que corre código que usa `SearchScope::AllCorpus` (incluyendo el test de integración del reranker), `hf-hub` descarga automáticamente `tokenizer.json`, `config.json` y `model.safetensors` de `BAAI/bge-reranker-v2-m3` (~2.2GB) y los cachea en `~/.cache/huggingface/hub`. Necesita red esa única vez; corridas siguientes son 100% offline.
 
+### 7. Configuración (`.env`, opcional)
+
+Todas las rutas, URLs de servicios, modelos y parámetros de tuning (Whisper, chunking, RAG) se pueden personalizar sin tocar el código:
+
+```bash
+cp .env.example .env
+```
+
+Editá solo lo que necesites — sin `.env`, o con una variable comentada, el comportamiento es idéntico al de un checkout limpio. Ver [`docs/configuracion.md`](docs/configuracion.md) para el detalle completo (qué controla cada variable y en qué archivo se lee).
+
 ## Correr en local
 
 ```bash
@@ -225,5 +235,6 @@ cargo test
 - [`docs/TODO.md`](docs/TODO.md) — trabajo pendiente, priorizado.
 - [`docs/terminology.md`](docs/terminology.md) — glosario de términos (ASR, Nyquist, chunk, tdrz, etc.).
 - [`docs/qdrant.md`](docs/qdrant.md) — cómo revisar/administrar Qdrant a mano (dashboard, comandos `curl`, qué significa cada campo).
+- [`docs/configuracion.md`](docs/configuracion.md) — todas las variables de `.env`: default, dónde se leen en el código, qué controlan.
 
 Las decisiones técnicas detalladas (params exactos de Whisper, reglas de dedupe de tdrz, límites de RAM) viven en `CLAUDE.local.md`, que es un archivo personal no versionado.

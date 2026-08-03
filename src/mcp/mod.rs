@@ -20,7 +20,7 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::audio_pipeline::models::JobMetadata;
-use crate::rag::{SEARCH_TOP_K, ScopeArg, hit_to_json, rag_answer as ejecutar_rag_answer, search};
+use crate::rag::{ScopeArg, hit_to_json, rag_answer as ejecutar_rag_answer, search};
 use crate::state::SharedState;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -111,7 +111,8 @@ impl RagServer {
             &self.state.qdrant,
             &query,
             &scope.into(),
-            SEARCH_TOP_K,
+            self.state.config.rag.search_top_k,
+            &self.state.config.rag,
         )
         .await
         .map_err(|e| error_interno("search_transcript", e))?;
@@ -149,6 +150,7 @@ impl RagServer {
             &self.state.qdrant,
             &question,
             &scope.into(),
+            &self.state.config.rag,
         )
         .await
         .map_err(|e| error_interno("rag_answer", e))?;

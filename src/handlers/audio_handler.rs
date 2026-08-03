@@ -95,7 +95,9 @@ pub async fn recibir_y_procesar_audio(
     // Streaming directo al SSD para evitar Thrashing de la RAM.
     if let Err(e) = archivo_local.write_all(&primer_chunk).await {
         tracing::error!("Error escribiendo en disco: {}", e);
-        let _ = tokio::fs::remove_dir_all(format!("./jobs/{}", metadata.job_id)).await;
+        let _ =
+            tokio::fs::remove_dir_all(crate::config::get().paths.jobs_dir.join(&metadata.job_id))
+                .await;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Error al guardar el archivo",
@@ -114,7 +116,10 @@ pub async fn recibir_y_procesar_audio(
                 // igual. Ese archivo corrupto recién fallaba horas después, al decodificarlo en
                 // Fase 2, sin ningún indicio de que la subida nunca se completó.
                 tracing::error!("Error leyendo el archivo del multipart: {e}");
-                let _ = tokio::fs::remove_dir_all(format!("./jobs/{}", metadata.job_id)).await;
+                let _ = tokio::fs::remove_dir_all(
+                    crate::config::get().paths.jobs_dir.join(&metadata.job_id),
+                )
+                .await;
                 return (
                     StatusCode::BAD_REQUEST,
                     format!(
@@ -129,7 +134,10 @@ pub async fn recibir_y_procesar_audio(
 
         if let Err(e) = archivo_local.write_all(&chunk).await {
             tracing::error!("Error escribiendo en disco: {}", e);
-            let _ = tokio::fs::remove_dir_all(format!("./jobs/{}", metadata.job_id)).await;
+            let _ = tokio::fs::remove_dir_all(
+                crate::config::get().paths.jobs_dir.join(&metadata.job_id),
+            )
+            .await;
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error al guardar el archivo",
@@ -228,8 +236,14 @@ fn lanzar_procesamiento_job(state: SharedState, metadata: JobMetadata, es_resume
                 }
 
                 tracing::info!(target: "lifecycle", job_id = %audio_id, "Generando embeddings del job");
-                match run_embedding_phase(&state.ollama, &state.qdrant, &audio_id, &transcript_path)
-                    .await
+                match run_embedding_phase(
+                    &state.ollama,
+                    &state.qdrant,
+                    &audio_id,
+                    &transcript_path,
+                    &state.config.rag,
+                )
+                .await
                 {
                     Ok(()) => {
                         if let Err(e) = update_job_metadata(&audio_id, |m| {
@@ -299,7 +313,13 @@ fn lanzar_generacion_resumen(state: SharedState, audio_id: String) {
         }
 
         tracing::info!(target: "lifecycle", job_id = %audio_id, "Generando el resumen del job");
-        match crate::rag::generate_summary(&state.ollama, &metadata.transcript_path).await {
+        match crate::rag::generate_summary(
+            &state.ollama,
+            &metadata.transcript_path,
+            &state.config.rag,
+        )
+        .await
+        {
             Ok(texto) => {
                 let persistido = write_atomic(&metadata.summary_path(), &texto);
                 let nuevo_status = if persistido.is_ok() {

@@ -36,6 +36,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt"] }
 tracing-appender = "0.2.3"
 tokio-util = { version = "0.7.18", features = ["io", "rt"] }
+dotenvy = "0.15"
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }

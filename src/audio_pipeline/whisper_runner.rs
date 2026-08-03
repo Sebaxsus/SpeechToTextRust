@@ -4,12 +4,7 @@ use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
 };
 
-/// Frase de sesgo de idioma/registro pasada a `set_initial_prompt` en cada chunk — genérica (no
-/// vocabulario de un dominio específico como construcción) para que sirva igual en audios futuros
-/// de cualquier tema. Agregada 2026-07-31 como mitigación de alucinaciones tipo "(Portuguesa)"
-/// (ver CLAUDE.local.md).
-const INITIAL_PROMPT_ES: &str =
-    "Transcripción de una reunión de trabajo en español, conversación natural.";
+use crate::config::WhisperConfig;
 
 /// Resultado de transcribir un chunk: texto + métricas de calidad/confianza derivadas de los
 /// segmentos y tokens que devuelve whisper-rs. No se persiste tal cual — `pipeline.rs` lo separa
@@ -40,44 +35,50 @@ pub(crate) struct ChunkTranscription {
 /// trabajo de CPU síncrono y bloquearía el runtime async si corriera en `tokio::spawn` directo.
 pub struct WhisperRunner {
     state: WhisperState,
+    /// Leído una sola vez del entorno al construir el runner (ver `config::Config`), nunca
+    /// releído por chunk — `build_params` se llama una vez por cada `transcribe_chunk`, así que
+    /// cachear esto acá evita volver a parsear variables de entorno en el loop caliente del
+    /// pipeline (ver `audio_pipeline::pipeline::run_pipeline`).
+    tuning: WhisperConfig,
 }
 
 impl WhisperRunner {
-    pub fn new(model_path: &str) -> anyhow::Result<Self> {
+    pub fn new(model_path: &str, tuning: WhisperConfig) -> anyhow::Result<Self> {
         let ctx = WhisperContext::new_with_params(model_path, WhisperContextParameters::default())?;
         let state = ctx.create_state()?;
-        Ok(Self { state })
+        Ok(Self { state, tuning })
     }
 
-    /// Config de `FullParams` fijada en `CLAUDE.local.md` — no modificar sin justificar el
+    /// Config de `FullParams` — valores por defecto fijados/documentados en `CLAUDE.local.md`,
+    /// overridable vía `.env` (ver `config::WhisperConfig`) — no modificar sin justificar el
     /// impacto en precisión.
-    fn build_params() -> FullParams<'static, 'static> {
+    fn build_params(tuning: &WhisperConfig) -> FullParams<'static, 'static> {
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_language(Some("es"));
         params.set_translate(false);
         params.set_print_progress(false);
         params.set_print_special(false);
         params.set_no_context(false);
-        params.set_entropy_thold(2.3);
-        params.set_suppress_blank(true);
+        params.set_entropy_thold(tuning.entropy_thold);
+        params.set_suppress_blank(tuning.suppress_blank);
         // Suprime un conjunto fijo de tokens de vocabulario (símbolos/puntuación sueltos, entre
         // ellos literalmente "(" y ")" — ver whisper.cpp:6095-6100 vendorizado en
         // whisper-rs-sys). No es supresión de ruido de audio: es el fix quirúrgico contra el
         // loop de alucinación "(Portuguesa) (Portuguesa)..." documentado en CLAUDE.local.md
         // (2026-07-31) — bloquea el token que abre esas frases entre paréntesis.
-        params.set_suppress_nst(true);
+        params.set_suppress_nst(tuning.suppress_nst);
         // Sesga idioma/registro antes de cada chunk (ver CLAUDE.local.md). Nota: `set_initial_prompt`
         // filtra la CString internamente (`into_raw()` sin `Drop` en whisper-rs 0.16.0) — leak de
         // ~100 bytes por llamada, negligible frente al límite de 16GB en un job de horas.
-        params.set_initial_prompt(INITIAL_PROMPT_ES);
-        params.set_temperature(0.0);
-        params.set_temperature_inc(0.1);
-        params.set_logprob_thold(-0.8);
-        params.set_no_speech_thold(0.5);
-        params.set_single_segment(false);
-        params.set_token_timestamps(false);
-        params.set_split_on_word(true);
-        params.set_n_threads(8);
+        params.set_initial_prompt(&tuning.initial_prompt);
+        params.set_temperature(tuning.temperature);
+        params.set_temperature_inc(tuning.temperature_inc);
+        params.set_logprob_thold(tuning.logprob_thold);
+        params.set_no_speech_thold(tuning.no_speech_thold);
+        params.set_single_segment(tuning.single_segment);
+        params.set_token_timestamps(tuning.token_timestamps);
+        params.set_split_on_word(tuning.split_on_word);
+        params.set_n_threads(tuning.n_threads);
         params
     }
 
@@ -89,7 +90,7 @@ impl WhisperRunner {
         &mut self,
         samples: &[f32],
     ) -> anyhow::Result<ChunkTranscription> {
-        let params = Self::build_params();
+        let params = Self::build_params(&self.tuning);
         self.state.full(params, samples)?;
 
         let mut text = String::new();

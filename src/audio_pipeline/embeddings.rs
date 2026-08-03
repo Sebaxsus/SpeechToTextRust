@@ -16,13 +16,16 @@ use crate::audio_pipeline::models::TranscriptEntry;
 /// colección por audio: a la escala de este proyecto (~600 vectores por audio de 5h) el overhead
 /// fijo de HNSW/segmentos/WAL por colección no se justifica dividiendo.
 ///
-/// `pub(crate)` (junto con `EMBEDDING_MODEL` y `deterministic_point_id` abajo) para que
-/// `crate::rag::retrieval` (Fase 5) los reutilice en vez de duplicar el nombre de colección, el
-/// modelo de embeddings o el esquema de point ID — una divergencia ahí haría que la Fase 5
-/// buscara silenciosamente en la colección equivocada o recalculara IDs que no matchean.
+/// `pub(crate)` (junto con `deterministic_point_id` abajo) para que `crate::rag::retrieval`
+/// (Fase 5) lo reutilice en vez de duplicar el nombre de colección o el esquema de point ID — una
+/// divergencia ahí haría que la Fase 5 buscara silenciosamente en la colección equivocada o
+/// recalculara IDs que no matchean.
 pub(crate) const COLLECTION_NAME: &str = "transcripts";
-/// `bge-m3` — dense, 1024 dims, soporte multilingüe real (español incluido).
-pub(crate) const EMBEDDING_MODEL: &str = "bge-m3";
+/// Dimensión fija de `bge-m3` (dense, 1024) — a diferencia del *nombre* del modelo
+/// (`RagConfig::embedding_model`, configurable vía `.env`), esto NO es un tuning: cambiar de
+/// modelo de embeddings a uno con otra dimensión rompe la colección de Qdrant ya creada
+/// (`VectorParamsBuilder` fija esta dimensión al crearla), así que queda fuera de `.env` a
+/// propósito.
 const EMBEDDING_DIM: u64 = 1024;
 
 /// Crea la colección `transcripts` si no existe todavía: `Cosine`, vectores+payload `on_disk`
@@ -74,6 +77,7 @@ pub async fn run_embedding_phase(
     qdrant: &Qdrant,
     audio_id: &str,
     transcript_path: &str,
+    rag: &crate::config::RagConfig,
 ) -> anyhow::Result<()> {
     ensure_collection(qdrant).await?;
 
@@ -94,7 +98,7 @@ pub async fn run_embedding_phase(
 
         let is_last_line = lines.peek().is_none();
         let mut request = GenerateEmbeddingsRequest::new(
-            EMBEDDING_MODEL.to_string(),
+            rag.embedding_model.clone(),
             EmbeddingsInput::Single(entry.text.clone()),
         );
         if is_last_line {
@@ -181,6 +185,7 @@ mod tests {
             &qdrant,
             &audio_id,
             transcript_path.to_str().unwrap(),
+            &crate::config::get().rag,
         )
         .await;
 

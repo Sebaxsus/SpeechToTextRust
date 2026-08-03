@@ -7,7 +7,7 @@
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::Deserialize;
 
-use crate::rag::{SEARCH_TOP_K, ScopeArg, hit_to_json, rag_answer, search};
+use crate::rag::{ScopeArg, hit_to_json, rag_answer, search};
 use crate::state::SharedState;
 
 #[derive(Debug, Deserialize)]
@@ -43,7 +43,8 @@ pub async fn buscar_handler(
         &state.qdrant,
         &query,
         &scope.into(),
-        SEARCH_TOP_K,
+        state.config.rag.search_top_k,
+        &state.config.rag,
     )
     .await
     {
@@ -77,7 +78,15 @@ pub async fn rag_answer_handler(
         .await
         .unwrap();
 
-    match rag_answer(&state.ollama, &state.qdrant, &question, &scope.into()).await {
+    match rag_answer(
+        &state.ollama,
+        &state.qdrant,
+        &question,
+        &scope.into(),
+        &state.config.rag,
+    )
+    .await
+    {
         Ok(respuesta) => Json(serde_json::json!({ "answer": respuesta })).into_response(),
         Err(e) => {
             tracing::error!("Error en /api/rag/answer: {e}");

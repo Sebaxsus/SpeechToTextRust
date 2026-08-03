@@ -6,13 +6,6 @@ use tokenizers::{PaddingParams, Tokenizer};
 
 use super::retrieval::ChunkHit;
 
-/// Cross-encoder candidato fijado en CLAUDE.local.md — XLM-RoBERTa-large con una cabeza de
-/// clasificación de una sola salida (relevance score), multilingüe (incluye español). Mismo
-/// repo/arquitectura que usa el ejemplo oficial de `candle` (`candle-examples/examples/xlm-roberta`,
-/// tarea `Reranker`), que es la referencia sobre la que se basó esta implementación.
-const RERANKER_MODEL_ID: &str = "BAAI/bge-reranker-v2-m3";
-const RERANKER_REVISION: &str = "main";
-
 /// Reordena `hits` por relevancia real query↔passage con el cross-encoder — SOLO tiene sentido
 /// para `SearchScope::AllCorpus` (ver CLAUDE.local.md: con un solo audio el ranking por coseno
 /// del bi-encoder ya es casi exhaustivo). Es CPU-bound y debe correr dentro de
@@ -33,7 +26,16 @@ const RERANKER_REVISION: &str = "main";
 /// `~/.cache/huggingface/hub`). Es la única llamada de red de este módulo — documentada como
 /// excepción deliberada igual que el primer `ollama pull` o el fallback a `ffmpeg`/`ffprobe` (ver
 /// CLAUDE.local.md): corridas siguientes son 100% offline, el archivo ya está en disco.
-fn rerank_blocking(query: &str, mut hits: Vec<ChunkHit>) -> anyhow::Result<Vec<ChunkHit>> {
+///
+/// `model_id`/`revision` vienen de `RagConfig` (default `BAAI/bge-reranker-v2-m3`/`main`, ver
+/// CLAUDE.local.md) — si se cambia a otro repo hay que confirmar que expone la misma arquitectura
+/// (`XLMRobertaForSequenceClassification`, 1 label) o esta función falla al deserializar `config.json`.
+fn rerank_blocking(
+    query: &str,
+    mut hits: Vec<ChunkHit>,
+    model_id: &str,
+    revision: &str,
+) -> anyhow::Result<Vec<ChunkHit>> {
     if hits.len() <= 1 {
         return Ok(hits);
     }
@@ -41,9 +43,9 @@ fn rerank_blocking(query: &str, mut hits: Vec<ChunkHit>) -> anyhow::Result<Vec<C
     let device = Device::Cpu;
     let api = Api::new()?;
     let repo = api.repo(Repo::with_revision(
-        RERANKER_MODEL_ID.to_string(),
+        model_id.to_string(),
         RepoType::Model,
-        RERANKER_REVISION.to_string(),
+        revision.to_string(),
     ));
 
     let tokenizer_path = repo.get("tokenizer.json")?;
@@ -119,11 +121,20 @@ fn rerank_blocking(query: &str, mut hits: Vec<ChunkHit>) -> anyhow::Result<Vec<C
 /// el orden original del bi-encoder en vez de propagar el fallo — la prioridad de este paso es
 /// afinar el ranking, no bloquear una respuesta que igual tiene contexto razonable sin él (ver
 /// CLAUDE.local.md: tolerancia a fallos).
-pub async fn rerank(query: &str, hits: Vec<ChunkHit>) -> Vec<ChunkHit> {
+pub async fn rerank(
+    query: &str,
+    hits: Vec<ChunkHit>,
+    model_id: &str,
+    revision: &str,
+) -> Vec<ChunkHit> {
     let fallback = hits.clone();
     let query = query.to_string();
+    let model_id = model_id.to_string();
+    let revision = revision.to_string();
 
-    match tokio::task::spawn_blocking(move || rerank_blocking(&query, hits)).await {
+    match tokio::task::spawn_blocking(move || rerank_blocking(&query, hits, &model_id, &revision))
+        .await
+    {
         Ok(Ok(reranked)) => reranked,
         Ok(Err(e)) => {
             tracing::warn!("Reranker falló, se mantiene el orden del bi-encoder: {e}");
@@ -177,8 +188,14 @@ mod tests {
             hit("Mañana hay una reunión con el equipo de marketing a las diez."),
         ];
 
-        let reranked = rerank_blocking("¿Cuál es el presupuesto del proyecto?", hits)
-            .expect("el reranker falló contra el modelo real");
+        let cfg = crate::config::get();
+        let reranked = rerank_blocking(
+            "¿Cuál es el presupuesto del proyecto?",
+            hits,
+            &cfg.rag.reranker_model_id,
+            &cfg.rag.reranker_revision,
+        )
+        .expect("el reranker falló contra el modelo real");
 
         assert_eq!(
             reranked[0].chunk.text,
