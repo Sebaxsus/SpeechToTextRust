@@ -169,6 +169,31 @@ pub struct TranscriptResponse {
     entries: Vec<TranscriptEntryView>,
 }
 
+/// Arma la respuesta de transcript completo a partir de metadata ya cargada — compartida entre
+/// `obtener_transcript_handler` (REST) y la tool MCP `get_transcript` (`mcp::mod`), para no
+/// duplicar el chequeo de "transcript.jsonl no existe todavía" → `entries: []`. No valida
+/// `job_id` ni resuelve `metadata` — eso es responsabilidad de cada caller (cada uno tiene su
+/// propio criterio de error: `404` HTTP vs `McpError::invalid_params`).
+pub(crate) fn construir_transcript_response(
+    metadata: &JobMetadata,
+) -> anyhow::Result<TranscriptResponse> {
+    let entries: Vec<TranscriptEntryView> =
+        if std::path::Path::new(&metadata.transcript_path).exists() {
+            leer_jsonl_entries::<TranscriptEntry>(&metadata.transcript_path)?
+                .into_iter()
+                .map(TranscriptEntryView::from)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+    Ok(TranscriptResponse {
+        status: metadata.status,
+        transcript_ready: metadata.transcript_ready,
+        entries,
+    })
+}
+
 /// `GET /api/jobs/{job_id}/transcript` — contenido de `transcript.jsonl`. Siempre `200` mientras
 /// el job exista (`404` solo si no existe/UUID inválido, mismo criterio que el resto de estos
 /// endpoints) — el cliente decide qué hacer mirando `status`/`transcript_ready` en el body, no el
@@ -184,29 +209,17 @@ pub async fn obtener_transcript_handler(Path(job_id): Path<String>) -> impl Into
         }
     };
 
-    let entries: Vec<TranscriptEntryView> =
-        if std::path::Path::new(&metadata.transcript_path).exists() {
-            match leer_jsonl_entries::<TranscriptEntry>(&metadata.transcript_path) {
-                Ok(entries) => entries.into_iter().map(TranscriptEntryView::from).collect(),
-                Err(e) => {
-                    tracing::error!("No se pudo leer el transcript del job '{job_id}': {e}");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Error interno del servidor",
-                    )
-                        .into_response();
-                }
-            }
-        } else {
-            Vec::new()
-        };
-
-    Json(TranscriptResponse {
-        status: metadata.status,
-        transcript_ready: metadata.transcript_ready,
-        entries,
-    })
-    .into_response()
+    match construir_transcript_response(&metadata) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => {
+            tracing::error!("No se pudo leer el transcript del job '{job_id}': {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error interno del servidor",
+            )
+                .into_response()
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

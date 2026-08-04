@@ -42,6 +42,11 @@ pub struct GetAudioMetadataRequest {
     pub audio_id: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetTranscriptRequest {
+    pub audio_id: String,
+}
+
 fn error_interno(contexto: &str, err: anyhow::Error) -> McpError {
     tracing::error!("Error MCP ({contexto}): {err:?}");
     McpError::internal_error(contexto.to_string(), None)
@@ -180,6 +185,28 @@ impl RagServer {
         let payload = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![ContentBlock::text(payload)]))
     }
+
+    #[tool(
+        description = "Solo lectura: devuelve el transcript COMPLETO de un audio_id (todas las \
+            entries de transcript.jsonl — chunk/start/end/text/avg_logprob y el flag \
+            low_confidence ya calculado), NO un resumen. Pensada para que un cliente MCP externo \
+            (otro asistente de IA) lea el texto completo de la reunión y genere su propio \
+            resumen o responda preguntas libres sobre él, sin pasar por el Ollama local de este \
+            servidor. Si el pipeline todavía no escribió transcript.jsonl, devuelve entries: [] \
+            en vez de error. Nunca dispara ni modifica ninguna transcripción."
+    )]
+    async fn get_transcript(
+        &self,
+        Parameters(GetTranscriptRequest { audio_id }): Parameters<GetTranscriptRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let metadata = leer_job(&audio_id).await.map_err(|_| {
+            McpError::invalid_params(format!("no existe el job '{audio_id}'"), None)
+        })?;
+        let response = crate::handlers::jobs_handler::construir_transcript_response(&metadata)
+            .map_err(|e| error_interno("get_transcript", e))?;
+        let payload = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![ContentBlock::text(payload)]))
+    }
 }
 
 #[tool_handler]
@@ -191,8 +218,9 @@ impl ServerHandler for RagServer {
             .with_instructions(
                 "Servidor MCP de solo lectura sobre transcripciones RAG local-first. Tools: \
                  search_transcript (retrieval), rag_answer (retrieval + generación vía Ollama), \
-                 list_audios, get_audio_metadata. Nunca escribe ni borra en Qdrant, nunca \
-                 dispara transcripciones nuevas."
+                 list_audios, get_audio_metadata, get_transcript (transcript completo, para que \
+                 un modelo de IA externo genere su propio análisis/resumen). Nunca escribe ni \
+                 borra en Qdrant, nunca dispara transcripciones nuevas."
                     .to_string(),
             )
     }

@@ -40,8 +40,8 @@ Mcp-Session-Id: {{initialize.response.headers.mcp-session-id}}
   "method": "notifications/initialized"
 }
 
-### 3. tools/list — lista las 4 tools expuestas: search_transcript, rag_answer, list_audios,
-### get_audio_metadata (con su JSON Schema de parámetros).
+### 3. tools/list — lista las 5 tools expuestas: search_transcript, rag_answer, list_audios,
+### get_audio_metadata, get_transcript (con su JSON Schema de parámetros).
 POST {{baseUrl}}/mcp
 Content-Type: application/json
 Accept: application/json, text/event-stream
@@ -153,5 +153,24 @@ Mcp-Session-Id: {{initialize.response.headers.mcp-session-id}}
       "scope": "audio",
       "audio_id": "REEMPLAZAR-CON-UN-JOB-ID-REAL"
     }
+  }
+}
+
+### 9. tools/call get_transcript — transcript completo (no un resumen), para que un cliente MCP
+### externo genere su propio análisis. Reemplazá "audio_id". Requiere que transcript.jsonl ya
+### exista (no alcanza con job.json) — si no, devuelve entries: [] en vez de error.
+POST {{baseUrl}}/mcp
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{initialize.response.headers.mcp-session-id}}
+# Authorization: Bearer {{token}}
+
+{
+  "jsonrpc": "2.0",
+  "id": 8,
+  "method": "tools/call",
+  "params": {
+    "name": "get_transcript",
+    "arguments": { "audio_id": "REEMPLAZAR-CON-UN-JOB-ID-REAL" }
   }
 }

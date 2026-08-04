@@ -265,7 +265,7 @@ Middleware `exigir_bearer_token` (`router.rs`), aplicado a `/mcp` **y** a los en
 
 ### Tools disponibles
 
-Las 4 tools son de **solo lectura** por diseño — ninguna escribe/borra en Qdrant ni dispara transcripciones nuevas (regla dura, ver `CLAUDE.local.md`).
+Las 5 tools son de **solo lectura** por diseño — ninguna escribe/borra en Qdrant ni dispara transcripciones nuevas (regla dura, ver `CLAUDE.local.md`).
 
 **`search_transcript` y `rag_answer` esperan el mismo `heavy_compute_semaphore` que usa Whisper** (2026-07-29) — si hay una transcripción en curso, la tool queda esperando el permiso antes de correr, potencialmente varios minutos en un audio largo. `list_audios`/`get_audio_metadata` no esperan nada (solo leen `job.json` de disco).
 
@@ -324,6 +324,14 @@ Sin parámetros. Enumera `./jobs/*`, lee cada `job.json` vía el mismo loader va
 - **Input**: `{"audio_id": "<uuid>"}`
 - **Output**: un único `JobMetadata` (mismo schema completo, mismas rutas de disco expuestas).
 - Si `audio_id` no es un UUID válido o no existe el job: error JSON-RPC `-32602` (`invalid_params`), no un `CallToolResult` de error — importante para el cliente: hay que manejar el error a nivel de protocolo MCP, no solo inspeccionar el body de un `CallToolResult`.
+
+#### `get_transcript` (agregada 2026-08-03)
+
+Devuelve el transcript **completo** de un audio (no un resumen ni un retrieval top-k) — pensada para que un cliente MCP externo (otro asistente de IA, Claude Desktop, etc.) lea el texto entero de la reunión y genere su propio análisis/resumen del lado de ese cliente, sin pasar por el Ollama local del proyecto. Comparte lógica 1:1 con `GET /api/jobs/{job_id}/transcript` vía `handlers::jobs_handler::construir_transcript_response` (`pub(crate)`), para no duplicar el chequeo de "transcript.jsonl no existe todavía" → `entries: []`.
+
+- **Input**: `{"audio_id": "<uuid>"}`
+- **Output**: mismo shape que `TranscriptResponse` del endpoint REST — `status`, `transcript_ready`, y `entries` (cada una con `chunk`/`start`/`end`/`text`/`avg_logprob` y el `low_confidence` calculado según `LOW_CONFIDENCE_THOLD`).
+- Si `audio_id` no es un UUID válido o no existe el job: error JSON-RPC `-32602` (`invalid_params`), mismo criterio que `get_audio_metadata`. Un fallo de I/O leyendo el `.jsonl` (distinto de "no existe todavía") es un error interno de la tool, no `invalid_params`.
 
 ### Schema de `JobMetadata` (el que devuelven `list_audios`/`get_audio_metadata`)
 
