@@ -84,6 +84,28 @@ Módulo `src/mcp/mod.rs`. `rmcp` 2.2.0 (SDK oficial de Rust para MCP) montado so
 - **Fase opcional — WebSocket + TLS** para la conversación interfaz↔RAG (además del MCP): `axum-server` + `rustls` (certificado autofirmado válido para LAN), streaming de tokens y sesión persistente multi-turno. No es parte del MVP (que funciona con request/response simple vía MCP); es una mejora de UX posterior.
 - **Interfaz web**: todavía no implementada — fuera del alcance de esta iteración.
 
+## Observabilidad y operación (implementado 2026-08-03)
+
+Cross-cutting a todas las fases — no es una fase propia del pipeline, sino la infraestructura para operar el servidor en vivo (qué ves en consola, qué queda persistido para diagnóstico, cómo se cierra el proceso).
+
+### Logger — consola curada + archivo completo (`main.rs`)
+
+Un único `Subscriber` de `tracing` (`tracing_subscriber::registry()`) con dos `Layer`s independientes, cada uno con su propio filtro — no dos loggers separados, un solo punto de instalación:
+
+- **Consola**: solo eventos marcados `target: "lifecycle"` (las transiciones de estado de un job — "transcribiendo", "resumiendo", "generando embeddings", "generando/listo el resumen", "enviando el estado", arranque del servidor — ver `handlers::audio_handler`/`handlers::jobs_handler`/`main.rs`) más cualquier `WARN`/`ERROR` de cualquier módulo, taggeado o no (una degradación tolerada o un error real siempre es "información importante"). `cargo run -- --log` cambia este filtro a "todo, incluido `DEBUG`" — modo verboso para debugging interactivo en vivo, igual que el flag ya existía antes de este cambio.
+- **Archivo** (`logs/server.YYYY-MM-DD.log`, rotación diaria vía `tracing_appender::rolling::daily`): **siempre** a nivel `DEBUG`, sin importar `--log` — es el log completo para diagnóstico post-mortem. Arranca en las mismas transiciones de `lifecycle` y suma el detalle que la consola nunca muestra: las métricas por chunk de Whisper (`audio_pipeline::pipeline::run_pipeline`, ya existían antes de este cambio) y, agregado ahora, lo que devuelven Ollama y Qdrant en cada llamada (`audio_pipeline::embeddings`: dimensión del embedding y confirmación de upsert por chunk; `rag::summary`: longitud del resumen de cada lote/consolidación; `rag::retrieval`: cantidad de hits de una búsqueda; `rag::generation`: longitud de la respuesta de `rag_answer`).
+- Escritura vía `tracing_appender::non_blocking` — **no** levanta un runtime nuevo, es un único hilo de SO dedicado a hacer el `write()` a disco, alimentado por un channel; el impacto en RAM/CPU es negligible frente a Whisper/Ollama. El `WorkerGuard` que devuelve se mantiene vivo hasta el final de `main` (si se dropeara antes, se perderían las últimas líneas sin flushear).
+- El directorio `logs/` se crea con `std::fs::create_dir_all` al arrancar (mismo patrón que `audio_pipeline::job::create_job` para `./jobs/`) — `tracing_appender::rolling` no lo crea solo. Sin política de retención todavía: los archivos diarios se acumulan indefinidamente, a revisar si el volumen se vuelve un problema real.
+
+### Graceful shutdown (CTRL+C)
+
+`axum::serve(...).with_graceful_shutdown(esperar_ctrl_c(...))` — antes de este cambio, CTRL+C mataba el proceso en seco (comportamiento default del SO, sin ningún manejo). Ahora, al recibir CTRL+C:
+
+1. Se cancela `AppState.mcp_cancellation_token` (`tokio_util::sync::CancellationToken`, compartido con `mcp::build_service` vía `StreamableHttpServerConfig::with_cancellation_token`) — esto le avisa a `LocalSessionManager` que cierre las sesiones MCP abiertas en vez de dejarlas colgadas hasta que el proceso muera (cierra el gap que documentaba `docs/TODO.md`: "Sin `CancellationToken` propio ni graceful shutdown").
+2. `axum::serve` deja de aceptar conexiones nuevas y drena las requests HTTP en curso antes de salir.
+
+**No cubre** el trabajo CPU-bound de Whisper a mitad de un chunk dentro de `spawn_blocking` (ese progreso parcial se pierde igual que con un kill directo) — pero por diseño no es un problema: `checkpoint.json` solo avanza tras un chunk completo (ver Fase 3), así que el siguiente `POST /api/jobs/{job_id}/resume` retoma exactamente donde cortó, sin reprocesar ni perder nada más allá del chunk en curso.
+
 ## Concurrencia
 
 - `AppState.heavy_compute_semaphore` (`tokio::sync::Semaphore::new(1)`, ver `state.rs`) limita a **una sola carga pesada de CPU/modelo a la vez en todo el proceso** — no solo la transcripción. Whisper (`run_pipeline`, vía `POST /api/upload-audio`/`resume`) y las tools de RAG server-side de MCP (`search_transcript` con `scope: all_corpus` — dispara el reranker cross-encoder — y `rag_answer` — generación con el modelo de 7-8B) compiten por el mismo único permiso. Esto cierra un gap real detectado en revisión de código (2026-07-29): antes de este fix, una consulta RAG podía correr en paralelo a una transcripción de Whisper, dos cargas CPU-bound compitiendo por los mismos threads — exactamente lo que "NO paralelismo agresivo" prohíbe. `list_audios`/`get_audio_metadata` (solo leen `job.json` de disco) no adquieren este permiso — no son carga pesada.

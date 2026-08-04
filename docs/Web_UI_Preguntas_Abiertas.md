@@ -4,7 +4,7 @@ Estas son dos funcionalidades pensadas para la futura interfaz web (Fase 6, toda
 
 Ver `docs/TODO.md` (Fase 6) para el punteo corto que referencia este documento.
 
-## 1. Resumen corto del transcript (para identificar audios en la UI)
+## 1. Resumen corto del transcript (para identificar audios en la UI) — RESUELTO 2026-08-01
 
 **Objetivo**: que el usuario pueda mirar una lista de audios procesados y reconocer cuál es cuál sin abrir cada `transcript.jsonl` — algo como "Reunión sobre los acuerdos de uso de zonas comunes" al lado de cada `job_id`.
 
@@ -26,9 +26,9 @@ Tres estrategias evaluadas, cada una con un costo real distinto:
 - Una sola llamada corta — costo mínimo, similar a B pero explícitamente acotado (no hay sorpresa de truncamiento silencioso).
 - Riesgo de calidad conocido de antemano: si la reunión arranca con charla informal o gente entrando, el resumen puede no reflejar el tema real tratado después. Va directamente en contra de la prioridad #1 del proyecto (accuracy).
 
-**Sin decidir todavía.** Antes de implementar, hace falta: (1) verificar el `num_ctx` real del modelo de generación en Ollama, y (2) decidir si el costo de CPU de un map-reduce completo es aceptable como job secundario, y bajo qué condiciones se le da prioridad frente a una transcripción nueva en curso (¿cola separada? ¿el mismo `heavy_compute_semaphore` que ya comparten Whisper y RAG, ver `docs/TODO.md`? ¿un semáforo propio de menor prioridad?).
+**Resuelto (2026-08-01) — variante de A: map-reduce por lotes**, no por chunk individual. Se verificó el `num_ctx` real: el modelo (`qwen2.5-7b-instruct`) soporta hasta 32768 tokens, pero Ollama sin `options.num_ctx` explícito corre con su default de 2048 (hallazgo que además afectaba a `rag_answer` existente, no solo a esta feature — ver `CLAUDE.local.md`: "Generación"). En vez de una sola pasada a contexto máximo (riesgo de VRAM en GPUs de 6GB, ver más abajo) o 600 llamadas sueltas, se agrupan los chunks en ~10-15 lotes (50 chunks o 12000 caracteres cada uno) con `num_ctx=8192` por lote, más una consolidación final. Prioridad frente a una transcripción nueva: el mismo `heavy_compute_semaphore` compartido (no una cola separada ni un semáforo de menor prioridad) — mismo criterio que ya rige Whisper/RAG. Implementado en `src/rag/summary.rs`, disparado por `handlers::audio_handler::lanzar_generacion_resumen`. Ver `CLAUDE.local.md`: "Resumen por audio" para el detalle completo, incluyendo el razonamiento de GPU/VRAM que motivó la estrategia de lotes en vez de un contexto único gigante.
 
-## 2. Reproducir el audio de un segmento de baja confianza (`avg_logprob` bajo)
+## 2. Reproducir el audio de un segmento de baja confianza (`avg_logprob` bajo) — RESUELTO 2026-08-01
 
 **Objetivo**: dejar que el usuario escuche el audio original de un chunk marcado con `avg_logprob` bajo (candidato a transcripción defectuosa), para verificar manualmente si Whisper se equivocó.
 
@@ -42,4 +42,4 @@ Ya se conoce `start`/`end` de cada chunk (persistido en el payload de Qdrant y e
 - Más útil para debugging real: es exactamente la señal que el modelo analizó (después de downmix + resample + crossfade), no una re-extracción distinta que podría sonar distinto.
 - Pero **no se persiste hoy** — `StreamingDecoder` genera esos chunks en memoria y los descarta después de pasarlos a Whisper. Habría que, o (b1) persistir esos chunks a disco durante la Fase 2 (más I/O y más archivos por job, más espacio en SSD por job — nada gratis en un proyecto que ya es cuidadoso con el disco), o (b2) re-derivar el chunk on-demand re-decodeando desde el inicio del archivo hasta ese timestamp (lento, y duplica lógica de `StreamingDecoder` para un caso de uso puntual).
 
-**Sin decidir todavía.** La opción A es más barata de implementar (reusa `ffmpeg`, no persiste nada nuevo) pero sirve una señal ligeramente distinta a la que Whisper realmente procesó; la opción B es más fiel para debugging pero tiene un costo de diseño/disco no trivial. Evaluar cuando arranque la implementación real de la interfaz web.
+**Resuelto (2026-08-01) — opción A.** Implementado en `GET /api/jobs/{job_id}/audio-segment?start=..&end=..` (`handlers::jobs_handler::obtener_segmento_audio_handler`): `ffmpeg` async (`tokio::process::Command`, `.kill_on_drop(true)`) transcodea el rango pedido a mp3 y lo streamea directo como body de la respuesta (`tokio_util::io::ReaderStream` + `axum::body::Body::from_stream`), sin bufferear el clip completo ni persistir nada nuevo en disco. Rango máximo de 120s por request (`400` si se excede). Ver `CLAUDE.local.md`: "Reproducción de un segmento de audio" para el detalle completo, incluyendo la limitación conocida de que un fallo de `ffmpeg` a mitad de stream llega como audio truncado en vez de un error HTTP (inherente a cualquier respuesta streaming).

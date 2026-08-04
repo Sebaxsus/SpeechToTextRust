@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use anyhow::Context;
 use uuid::Uuid;
 
-use crate::audio_pipeline::models::{JobMetadata, JobStatus};
+use crate::audio_pipeline::models::{JobMetadata, JobStatus, SummaryStatus};
 use crate::audio_pipeline::util::{now_epoch_string, write_atomic};
 
 /// Serializa el read-modify-write de `update_job_metadata` frente a cualquier otra llamada
@@ -46,6 +46,7 @@ pub fn create_job(extension: &str) -> anyhow::Result<JobMetadata> {
         processing_started_at: None,
         transcript_ready_at: None,
         completed_at: None,
+        summary_status: SummaryStatus::default(),
     };
 
     let job_json_path = job_dir.join("job.json");

@@ -5,13 +5,23 @@
 //! (ver `router.rs`), porque exponen el mismo contenido transcrito sensible.
 
 use std::io::{BufRead, BufReader};
+use std::process::Stdio;
 
+use axum::body::Body;
+use axum::extract::Query;
+use axum::http::header::CONTENT_TYPE;
 use axum::{Json, extract::Path, http::StatusCode, response::IntoResponse};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
+use tokio_util::io::ReaderStream;
 
 use crate::audio_pipeline::checkpoint::CheckpointManager;
 use crate::audio_pipeline::job::{list_jobs, load_job};
-use crate::audio_pipeline::models::{ChunkMetrics, JobMetadata, JobStatus, TranscriptEntry};
+use crate::audio_pipeline::models::{
+    ChunkMetrics, JobMetadata, JobStatus, SummaryStatus, TranscriptEntry,
+};
+use crate::rag::LOW_CONFIDENCE_THOLD;
 
 /// Subconjunto público de `JobMetadata` — nunca expone `audio_path`/`transcript_path`/
 /// `checkpoint_path` (rutas de disco del servidor, estructura interna que un cliente remoto no
@@ -29,10 +39,31 @@ pub struct JobSummary {
     pub processing_started_at: Option<String>,
     pub transcript_ready_at: Option<String>,
     pub completed_at: Option<String>,
+    /// Ver `SummaryStatus` — estado del resumen por audio (map-reduce, tarea independiente
+    /// disparada después de `Completed`, ver `handlers::audio_handler::lanzar_generacion_resumen`).
+    pub summary_status: SummaryStatus,
+    /// Contenido de `summary.txt`, leído solo cuando `summary_status == Ready` — `None` en
+    /// cualquier otro caso (nunca un endpoint separado para esto, alcanza con este campo).
+    pub summary: Option<String>,
 }
 
 impl From<&JobMetadata> for JobSummary {
     fn from(metadata: &JobMetadata) -> Self {
+        let summary = if metadata.summary_status == SummaryStatus::Ready {
+            match std::fs::read_to_string(metadata.summary_path()) {
+                Ok(texto) => Some(texto),
+                Err(e) => {
+                    tracing::error!(
+                        "summary_status es Ready pero no se pudo leer summary.txt del job '{}': {e}",
+                        metadata.job_id
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             job_id: metadata.job_id.clone(),
             status: metadata.status,
@@ -41,6 +72,8 @@ impl From<&JobMetadata> for JobSummary {
             processing_started_at: metadata.processing_started_at.clone(),
             transcript_ready_at: metadata.transcript_ready_at.clone(),
             completed_at: metadata.completed_at.clone(),
+            summary_status: metadata.summary_status,
+            summary,
         }
     }
 }
@@ -98,6 +131,8 @@ pub async fn obtener_job_handler(Path(job_id): Path<String>) -> impl IntoRespons
             }
         };
 
+    tracing::info!(target: "lifecycle", job_id = %job_id, "Enviando el estado del job");
+
     Json(JobStatusResponse {
         summary: JobSummary::from(&metadata),
         last_chunk: checkpoint.last_chunk,
@@ -106,11 +141,32 @@ pub async fn obtener_job_handler(Path(job_id): Path<String>) -> impl IntoRespons
     .into_response()
 }
 
+/// Envuelve `TranscriptEntry` con un campo calculado (nunca persistido) `low_confidence` — el
+/// frontend nunca necesita conocer `LOW_CONFIDENCE_THOLD`, solo lee un booleano ya resuelto por
+/// el servidor. Cambiar el umbral a futuro no requiere reprocesar nada: se recalcula en cada
+/// lectura.
+#[derive(Debug, Serialize)]
+struct TranscriptEntryView {
+    #[serde(flatten)]
+    entry: TranscriptEntry,
+    low_confidence: bool,
+}
+
+impl From<TranscriptEntry> for TranscriptEntryView {
+    fn from(entry: TranscriptEntry) -> Self {
+        let low_confidence = entry.avg_logprob < LOW_CONFIDENCE_THOLD;
+        Self {
+            entry,
+            low_confidence,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct TranscriptResponse {
     pub status: JobStatus,
     pub transcript_ready: bool,
-    pub entries: Vec<TranscriptEntry>,
+    entries: Vec<TranscriptEntryView>,
 }
 
 /// `GET /api/jobs/{job_id}/transcript` — contenido de `transcript.jsonl`. Siempre `200` mientras
@@ -128,21 +184,22 @@ pub async fn obtener_transcript_handler(Path(job_id): Path<String>) -> impl Into
         }
     };
 
-    let entries = if std::path::Path::new(&metadata.transcript_path).exists() {
-        match leer_jsonl_entries::<TranscriptEntry>(&metadata.transcript_path) {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::error!("No se pudo leer el transcript del job '{job_id}': {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Error interno del servidor",
-                )
-                    .into_response();
+    let entries: Vec<TranscriptEntryView> =
+        if std::path::Path::new(&metadata.transcript_path).exists() {
+            match leer_jsonl_entries::<TranscriptEntry>(&metadata.transcript_path) {
+                Ok(entries) => entries.into_iter().map(TranscriptEntryView::from).collect(),
+                Err(e) => {
+                    tracing::error!("No se pudo leer el transcript del job '{job_id}': {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Error interno del servidor",
+                    )
+                        .into_response();
+                }
             }
-        }
-    } else {
-        Vec::new()
-    };
+        } else {
+            Vec::new()
+        };
 
     Json(TranscriptResponse {
         status: metadata.status,
@@ -188,6 +245,115 @@ pub async fn obtener_metricas_handler(Path(job_id): Path<String>) -> impl IntoRe
     };
 
     Json(MetricsResponse { entries }).into_response()
+}
+
+/// Duración máxima de un segmento pedido — evita una transcodificación arbitrariamente larga
+/// (o abusiva) a través de `GET /api/jobs/{job_id}/audio-segment`.
+const MAX_SEGMENT_SECONDS: f32 = 120.0;
+
+#[derive(Debug, Deserialize)]
+pub struct AudioSegmentParams {
+    pub start: f32,
+    pub end: f32,
+}
+
+/// `GET /api/jobs/{job_id}/audio-segment?start=..&end=..` — transcodea al vuelo con `ffmpeg` el
+/// rango `[start, end)` (segundos) del audio original a mp3, para que el cliente web pueda
+/// escuchar un segmento marcado con `avg_logprob` bajo (ver CLAUDE.local.md: reproducción de
+/// segmentos). Reusa el binario `ffmpeg` ya requerido por el pipeline (mismo orden `-ss` antes de
+/// `-i` que `audio_pipeline::decoder` para seek rápido de input) — no persiste nada nuevo en
+/// disco, sirve la calidad real del archivo subido (no el PCM 16kHz que Whisper procesó).
+///
+/// `tokio::process::Command` (async, no el `std::process::Command` síncrono que usa el decoder
+/// dentro de `spawn_blocking`) porque este handler no hace trabajo CPU-bound propio, solo proxea
+/// la salida de `ffmpeg`. `.kill_on_drop(true)` es el equivalente nativo de tokio al `Drop for
+/// Source` de `decoder.rs`: si el cliente corta la conexión y el stream se dropea antes de
+/// terminar, `ffmpeg` se mata solo, sin necesitar un guard manual.
+///
+/// No pasa por `heavy_compute_semaphore`: transcodificar unos segundos/minutos de audio es una
+/// carga de CPU corta, no comparable a Whisper/Ollama — mismo criterio que el fallback de
+/// `ffmpeg` en el decoder, que tampoco pasa por el semáforo.
+pub async fn obtener_segmento_audio_handler(
+    Path(job_id): Path<String>,
+    Query(params): Query<AudioSegmentParams>,
+) -> impl IntoResponse {
+    let metadata = match load_job(&job_id) {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            tracing::error!("No se pudo leer el job '{job_id}': {e}");
+            return (StatusCode::NOT_FOUND, "Job no encontrado").into_response();
+        }
+    };
+
+    let duracion = params.end - params.start;
+    if params.start < 0.0 || duracion <= 0.0 || duracion > MAX_SEGMENT_SECONDS {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Rango inválido: start debe ser >= 0, end > start, y la duración no puede \
+                 superar {MAX_SEGMENT_SECONDS} segundos"
+            ),
+        )
+            .into_response();
+    }
+
+    let mut child = match Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-ss",
+            &params.start.to_string(),
+            "-to",
+            &params.end.to_string(),
+            "-i",
+            &metadata.audio_path,
+            "-f",
+            "mp3",
+            "-",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::error!("No se pudo ejecutar ffmpeg para el job '{job_id}': {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error interno del servidor",
+            )
+                .into_response();
+        }
+    };
+
+    let stdout = child.stdout.take().expect("stdout configurado como piped");
+    let stream = ReaderStream::new(stdout);
+
+    // El proceso sigue corriendo en background hasta terminar (o hasta que `kill_on_drop` lo
+    // mate si el stream se dropea antes, ej. el cliente corta la conexión) — no bloqueamos la
+    // respuesta esperando su `wait()`. Limitación conocida: si `ffmpeg` falla a mitad de la
+    // transcodificación, el cliente ya recibió el header `200` y el audio llega truncado/corrupto
+    // en vez de un error HTTP — inherente a cualquier respuesta streaming, no resoluble sin
+    // bufferear todo el clip antes de responder (lo que iría contra streaming).
+    tokio::spawn(async move {
+        match child.wait().await {
+            Ok(status) if !status.success() => {
+                let mut stderr_buf = String::new();
+                if let Some(mut stderr) = child.stderr.take() {
+                    let _ = stderr.read_to_string(&mut stderr_buf).await;
+                }
+                tracing::warn!(
+                    "ffmpeg terminó con error extrayendo un segmento del job '{job_id}': {stderr_buf}"
+                );
+            }
+            Err(e) => tracing::warn!("No se pudo esperar el proceso ffmpeg (job '{job_id}'): {e}"),
+            _ => {}
+        }
+    });
+
+    ([(CONTENT_TYPE, "audio/mpeg")], Body::from_stream(stream)).into_response()
 }
 
 /// Lee un `.jsonl` línea por línea (streaming, `BufReader::lines()`, nunca `fs::read_to_string`

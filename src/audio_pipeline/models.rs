@@ -10,6 +10,20 @@ pub enum JobStatus {
     Failed,
 }
 
+/// Estado del resumen por audio (map-reduce vía `rag::summary::generate_summary`), disparado
+/// como tarea independiente después de `JobStatus::Completed` (ver
+/// `handlers::audio_handler::lanzar_generacion_resumen`). Bookkeeping chico en `job.json` — el
+/// contenido en sí vive en el sidecar `summary.txt` (`JobMetadata::summary_path()`), mismo
+/// criterio que separa `metrics.jsonl` de `job.json`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub enum SummaryStatus {
+    #[default]
+    NotStarted,
+    Generating,
+    Ready,
+    Failed,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JobMetadata {
     pub job_id: String,
@@ -36,6 +50,10 @@ pub struct JobMetadata {
     pub transcript_ready_at: Option<String>,
     #[serde(default)]
     pub completed_at: Option<String>,
+    /// Ver `SummaryStatus`. `#[serde(default)]` para que un `job.json` viejo (de antes de esta
+    /// feature) siga deserializando con `NotStarted`.
+    #[serde(default)]
+    pub summary_status: SummaryStatus,
 }
 
 impl JobMetadata {
@@ -45,6 +63,13 @@ impl JobMetadata {
     /// `GET /api/jobs/{job_id}/metrics`).
     pub fn metrics_path(&self) -> PathBuf {
         std::path::Path::new(&self.transcript_path).with_file_name("metrics.jsonl")
+    }
+
+    /// Deriva la ruta de `summary.txt` — mismo criterio que `metrics_path()`. Texto plano UTF-8
+    /// (no JSON): es un blob único escrito una vez cuando `summary_status` pasa a `Ready`, no un
+    /// log incremental como `transcript.jsonl`/`metrics.jsonl`.
+    pub fn summary_path(&self) -> PathBuf {
+        std::path::Path::new(&self.transcript_path).with_file_name("summary.txt")
     }
 }
 
