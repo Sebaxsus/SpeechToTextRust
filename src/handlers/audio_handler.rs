@@ -6,11 +6,87 @@ use crate::audio_pipeline::util::{now_epoch_string, write_atomic};
 use crate::router::UPLOAD_BODY_LIMIT_BYTES;
 use crate::state::SharedState;
 use axum::{
+    body::Bytes,
     extract::{Multipart, Path, State},
     http::StatusCode,
     response::IntoResponse,
 };
+use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
+
+/// Acepta solo `http`/`https` — chequeo mínimo a propósito (no un parseo completo de URL con la
+/// crate `url`), suficiente para descartar valores claramente inválidos antes de guardarlos; el
+/// riesgo de SSRF de una URL "válida" mal intencionada queda como riesgo aceptado y documentado
+/// (ver `JobMetadata::callback_url`), no algo que este chequeo pretenda cerrar del todo.
+fn callback_url_es_valida(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
+/// Recarga `job.json` (mismo criterio que `lanzar_generacion_resumen`: siempre ver el
+/// `callback_url` más reciente, no una copia de `JobMetadata` que pudo quedar desactualizada
+/// desde que se creó el job) y dispara el webhook si el job tiene uno configurado. No-op
+/// silencioso (solo un log) si el job no tiene `callback_url` o si `load_job` falla.
+fn disparar_webhook_si_corresponde(audio_id: &str, status: JobStatus) {
+    match load_job(audio_id) {
+        Ok(metadata) => {
+            if let Some(url) = metadata.callback_url {
+                notificar_callback_url(url, audio_id.to_string(), status);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("No se pudo recargar el job '{audio_id}' para el webhook: {e}");
+        }
+    }
+}
+
+/// Dispara un POST best-effort (`{"job_id", "status"}`) a `callback_url` cuando un job termina
+/// (`Completed`/`Failed`) — ver `JobMetadata::callback_url`. `tokio::spawn` aparte: nunca bloquea
+/// ni puede fallar la transición de estado que ya se persistió en `job.json` antes de llamar acá.
+/// Un único intento, sin cola de reintentos (mismo criterio ya aceptado en el proyecto para
+/// fallos de Fase 4/resumen — ver `docs/TODO.md`), con timeout corto para no dejar la tarea
+/// colgada si la URL no responde.
+fn notificar_callback_url(callback_url: String, job_id: String, status: JobStatus) {
+    #[derive(serde::Serialize)]
+    struct WebhookPayload {
+        job_id: String,
+        status: JobStatus,
+    }
+
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+        {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::warn!("No se pudo construir el cliente HTTP del webhook: {e}");
+                return;
+            }
+        };
+
+        let payload = WebhookPayload {
+            job_id: job_id.clone(),
+            status,
+        };
+
+        match client.post(&callback_url).json(&payload).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!(target: "lifecycle", job_id = %job_id, "Webhook notificado en {callback_url}");
+            }
+            Ok(resp) => {
+                tracing::warn!(
+                    "Webhook a {callback_url} respondió {} para el job '{job_id}'",
+                    resp.status()
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "No se pudo notificar el webhook {callback_url} para el job '{job_id}': {e}"
+                );
+            }
+        }
+    });
+}
 
 /// Mide la duración total del audio con `ffprobe` (mismo binario que ya requiere el fallback de
 /// `decoder.rs`, ver `CLAUDE.local.md`) — `tokio::process::Command` async, no la variante sync
@@ -102,6 +178,7 @@ pub async fn recibir_y_procesar_audio(
     // Por eso se itera cada campo según llega y se despacha por nombre — el cliente puede mandar
     // `title` antes o después del archivo, sin que el servidor le imponga un orden.
     let mut title: Option<String> = None;
+    let mut callback_url: Option<String> = None;
     let mut nombre_archivo: Option<String> = None;
     let mut metadata: Option<JobMetadata> = None;
 
@@ -161,6 +238,24 @@ pub async fn recibir_y_procesar_audio(
                 // título" igual, duplicando la lógica de fallback.
                 if !texto.is_empty() {
                     title = Some(texto.to_string());
+                }
+            }
+            continue;
+        }
+
+        if campo.name() == Some("callback_url") {
+            // Campo de texto corto (una URL) — mismo criterio que master antes del merge:
+            // `.text()` sin chunking manual, porque una URL nunca se acerca al orden de magnitud
+            // que justificaría el cuidado extra que sí tiene `title` arriba.
+            match campo.text().await {
+                Ok(texto) if callback_url_es_valida(texto.trim()) => {
+                    callback_url = Some(texto.trim().to_string());
+                }
+                Ok(texto) => {
+                    tracing::warn!("callback_url inválida ignorada: {texto}");
+                }
+                Err(e) => {
+                    tracing::warn!("No se pudo leer el campo callback_url del multipart: {e}");
                 }
             }
             continue;
@@ -285,6 +380,12 @@ pub async fn recibir_y_procesar_audio(
         metadata = Some(job_metadata);
     }
 
+    // A diferencia de la versión previa (un solo campo de archivo leído por fuera de cualquier
+    // loop, que necesitaba un `drop(campo)` explícito antes de pedir el siguiente campo — ver
+    // `git log` de este archivo si hace falta el detalle del bug real que motivó eso), acá cada
+    // `campo` vive scoped a una iteración del `loop` de arriba: sale de scope (y se dropea) solo
+    // con llegar al final de esa iteración o a un `continue`, siempre antes de que la iteración
+    // siguiente pida el próximo campo — el mismo problema queda evitado por construcción.
     let metadata = match metadata {
         Some(metadata) => metadata,
         None => {
@@ -305,6 +406,12 @@ pub async fn recibir_y_procesar_audio(
         && let Err(e) = update_job_metadata(&job_id, |m| m.title = Some(title))
     {
         tracing::error!("No se pudo guardar el título del job '{job_id}': {e}");
+    }
+
+    if let Some(url) = callback_url
+        && let Err(e) = update_job_metadata(&job_id, |m| m.callback_url = Some(url))
+    {
+        tracing::error!("No se pudo guardar callback_url del job '{job_id}': {e}");
     }
 
     // Corto y sincrónico con la respuesta HTTP a propósito (a diferencia de Whisper/embeddings,
@@ -378,12 +485,14 @@ fn lanzar_procesamiento_job(state: SharedState, metadata: JobMetadata, es_resume
                 if let Err(e) = update_job_metadata(&audio_id, |m| m.status = JobStatus::Failed) {
                     tracing::error!("No se pudo marcar el job '{audio_id}' como Failed: {e}");
                 }
+                disparar_webhook_si_corresponde(&audio_id, JobStatus::Failed);
             }
             Err(e) => {
                 tracing::error!("Error en el pipeline (join error): {}", e);
                 if let Err(e) = update_job_metadata(&audio_id, |m| m.status = JobStatus::Failed) {
                     tracing::error!("No se pudo marcar el job '{audio_id}' como Failed: {e}");
                 }
+                disparar_webhook_si_corresponde(&audio_id, JobStatus::Failed);
             }
             Ok(Ok(())) => {
                 // transcript_ready refleja que Fase 2/3 terminó bien, independientemente de si
@@ -417,6 +526,7 @@ fn lanzar_procesamiento_job(state: SharedState, metadata: JobMetadata, es_resume
                                 "No se pudo marcar el job '{audio_id}' como Completed: {e}"
                             );
                         }
+                        disparar_webhook_si_corresponde(&audio_id, JobStatus::Completed);
                         lanzar_generacion_resumen(state.clone(), audio_id);
                     }
                     Err(e) => {
@@ -428,6 +538,7 @@ fn lanzar_procesamiento_job(state: SharedState, metadata: JobMetadata, es_resume
                                 "No se pudo marcar el job '{audio_id}' como Failed: {e}"
                             );
                         }
+                        disparar_webhook_si_corresponde(&audio_id, JobStatus::Failed);
                     }
                 }
             }
@@ -517,6 +628,15 @@ fn lanzar_generacion_resumen(state: SharedState, audio_id: String) {
     });
 }
 
+/// Body JSON opcional de `POST /api/jobs/{job_id}/resume` — a diferencia del multipart de
+/// upload, acá se lee como JSON simple porque el endpoint no maneja ningún archivo. Sin body (el
+/// caso más común: reanudar sin cambiar nada) sigue siendo válido — ver `reanudar_job`.
+#[derive(Debug, Deserialize, Default)]
+struct ResumeBody {
+    #[serde(default)]
+    callback_url: Option<String>,
+}
+
 /// `POST /api/jobs/{job_id}/resume` — reanuda un job existente cuyo procesamiento se cortó a
 /// mitad de camino (proceso matado, crash, etc. — ver docs/TODO.md, Fase 3). `run_pipeline` ya
 /// era resume-safe a nivel de función; lo que faltaba era este entry point HTTP.
@@ -527,6 +647,7 @@ fn lanzar_generacion_resumen(state: SharedState, audio_id: String) {
 pub async fn reanudar_job(
     State(state): State<SharedState>,
     Path(job_id): Path<String>,
+    body: Bytes,
 ) -> impl IntoResponse {
     let metadata = match load_job(&job_id) {
         Ok(metadata) => metadata,
@@ -535,6 +656,31 @@ pub async fn reanudar_job(
             return (StatusCode::NOT_FOUND, "Job no encontrado").into_response();
         }
     };
+
+    // `Bytes` en vez de `Json<Option<ResumeBody>>`: el caso normal (reanudar sin body) no trae
+    // ningún JSON válido, y el extractor `Json` de axum rechaza un body vacío en vez de tratarlo
+    // como "no mandaron nada". Un body presente pero mal formado se ignora (se loguea) en vez de
+    // devolver 400 — el resume en sí es válido igual, con o sin ese dato.
+    if !body.is_empty() {
+        match serde_json::from_slice::<ResumeBody>(&body) {
+            Ok(ResumeBody {
+                callback_url: Some(url),
+            }) if callback_url_es_valida(&url) => {
+                if let Err(e) = update_job_metadata(&job_id, |m| m.callback_url = Some(url)) {
+                    tracing::error!("No se pudo actualizar callback_url del job '{job_id}': {e}");
+                }
+            }
+            Ok(ResumeBody {
+                callback_url: Some(url),
+            }) => {
+                tracing::warn!("callback_url inválida ignorada para el job '{job_id}': {url}");
+            }
+            Ok(ResumeBody { callback_url: None }) => {}
+            Err(e) => {
+                tracing::warn!("Body de resume ilegible para el job '{job_id}', se ignora: {e}");
+            }
+        }
+    }
 
     lanzar_procesamiento_job(state, metadata, true);
 

@@ -37,6 +37,11 @@ pub struct ServicesConfig {
     pub ollama_port: u16,
     pub qdrant_url: String,
     pub bind_addr: String,
+    /// Origen permitido para CORS (`Access-Control-Allow-Origin`) — necesario para que el
+    /// cliente web (Astro, corriendo en un origen/puerto distinto) pueda llamar la API directo
+    /// desde `fetch()` del browser. Default `http://localhost:4321`, el puerto default del modo
+    /// dev de Astro. Ver `router::crear_router`.
+    pub client_origin: String,
 }
 
 /// Calco 1:1 de los `set_*` de `FullParams` en `audio_pipeline::whisper_runner::build_params` —
@@ -172,6 +177,7 @@ impl Config {
             ollama_port: env_or_default("OLLAMA_PORT", 11434u16)?,
             qdrant_url: env_or_default("QDRANT_URL", "http://localhost:6334".to_string())?,
             bind_addr: env_or_default("SERVER_BIND_ADDR", "0.0.0.0:3000".to_string())?,
+            client_origin: env_or_default("CLIENT_ORIGIN", "http://localhost:4321".to_string())?,
         };
 
         let whisper = WhisperConfig {

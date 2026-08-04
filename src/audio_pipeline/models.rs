@@ -78,6 +78,17 @@ pub struct JobMetadata {
     /// para que un `job.json` viejo siga deserializando.
     #[serde(default)]
     pub title: Option<String>,
+    /// URL opcional a la que el servidor hace un POST best-effort (`{"job_id", "status"}`) cuando
+    /// el job termina (`Completed`/`Failed`) — ver `handlers::audio_handler::notificar_callback_url`.
+    /// Provista por el cliente al subir el audio (campo `callback_url` del multipart) o al
+    /// reanudar (`POST /api/jobs/{job_id}/resume`, body JSON opcional). Solo se acepta con
+    /// esquema `http`/`https`; cualquier otro valor se ignora y se loguea, nunca hace fallar el
+    /// upload/resume por esto. **Riesgo aceptado, no mitigado con allowlisting de hosts**: es una
+    /// URL provista por el cliente a la que el servidor hace una petición saliente (superficie de
+    /// SSRF) — aceptable en este proyecto local-first de un solo usuario, no pensado para
+    /// exponerse a callers no confiables (ver docs/api_reference.md).
+    #[serde(default)]
+    pub callback_url: Option<String>,
 }
 
 impl JobMetadata {

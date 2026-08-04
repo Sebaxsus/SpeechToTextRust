@@ -11,8 +11,17 @@ Estado actual de la superficie HTTP del servidor (`src/main.rs`, `src/router.rs`
 - `heavy_compute_semaphore` (`Semaphore::new(1)`): como máximo una carga pesada de CPU/modelo a la vez en todo el proceso — compartido entre `POST /api/upload-audio`/`POST /api/jobs/{job_id}/resume` (Whisper) y las tools MCP `search_transcript`/`rag_answer` **y** sus equivalentes REST `POST /api/search`/`POST /api/rag/answer` (Ollama/reranker). Antes se llamaba `transcription_semaphore` y solo gateaba el pipeline de audio; se amplió (2026-07-29) tras detectar que las tools de RAG no tenían ningún gate de concurrencia propio.
 - Si `MCP_BEARER_TOKEN` no está seteado en el entorno, el proceso imprime una advertencia por consola al arrancar (no rechaza arrancar, no rechaza bindear a `0.0.0.0`) — ver "Autenticación" más abajo.
 - Logging (agregado 2026-07-31, ver `CLAUDE.local.md`): `cargo run -- --log` sube el nivel del logger centralizado (`tracing`) a `DEBUG`, mostrando las métricas por chunk del pipeline además de lo que ya se ve por defecto (arranque, warnings, errores). Sin el flag, el nivel es `INFO` — misma visibilidad que antes de migrar a `tracing`.
+- **CORS habilitado** (`tower_http::cors::CorsLayer`, aplicado a todo el router en `router::crear_router`): origen permitido configurable vía `CLIENT_ORIGIN` (default `http://localhost:4321`, el puerto default del modo dev de Astro), métodos `GET`/`POST`, headers `Authorization`/`Content-Type`. Necesario para que el cliente web llame la API directo desde `fetch()` del browser sin proxy intermedio. Un `CLIENT_ORIGIN` mal formado cae al default (se loguea un warning), no hace panic al arrancar.
 
-No hay healthcheck (`GET /health` o similar) implementado todavía.
+## `GET /health`
+
+Healthcheck simple, **sin autenticación** (a propósito: el cliente lo usa para distinguir "backend no alcanzable" de "token inválido" antes de mostrar la pantalla de login).
+
+- **Output**: `200` siempre que el proceso esté vivo.
+  ```json
+  {"status": "ok", "heavy_compute_busy": false}
+  ```
+  `heavy_compute_busy` sale de `heavy_compute_semaphore.available_permits() == 0` — `true` si Whisper o una consulta RAG están corriendo ahora mismo (ver "Arranque del servidor" arriba). Pensado para que el cliente muestre un aviso no bloqueante ("el servidor está ocupado, puede tardar") antes de mandar una consulta pesada, en vez de que la request quede esperando el semáforo sin ninguna explicación visible.
 
 ## Rutas registradas
 
@@ -20,6 +29,7 @@ No hay healthcheck (`GET /health` o similar) implementado todavía.
 
 | Método | Ruta | Handler | Auth | Descripción corta |
 |---|---|---|---|---|
+| `GET` | `/health` | `router::healthcheck` | No | Healthcheck + si hay una carga pesada corriendo ahora mismo. |
 | `POST` | `/api/upload-audio` | `recibir_y_procesar_audio` | No | Sube un audio nuevo, crea un job, dispara el pipeline. |
 | `POST` | `/api/jobs/{job_id}/resume` | `reanudar_job` | No | Reanuda un job existente cortado a mitad de camino. |
 | `GET` | `/api/jobs` | `jobs_handler::listar_jobs_handler` | Sí | Lista todos los jobs (equivalente REST de `list_audios`). |
@@ -52,6 +62,9 @@ Sube un archivo de audio, crea un job nuevo (`job_id` UUID v4) y dispara el pipe
   - Caja ISO-BMFF `ftyp` en el offset 4 (`bytes[4..8] == "ftyp"`) → tratado como `mp4` (cubre también `.m4a`, mismo contenedor).
   - `RIFF....WAVE` en los primeros 12 bytes → tratado como `wav` (agregado 2026-07-30; Symphonia lo decodifica nativo, sin pasar por el fallback de ffmpeg).
   - Cualquier otra cosa → `400`, sin crear directorio de job ni escribir nada a disco.
+- El nombre de archivo (`filename` del campo) se persiste como `JobMetadata::original_filename` (dato plano, `None` si no se mandó — nunca se usa para construir una ruta de disco) — pensado para que el cliente web muestre un título en vez de un UUID pelado.
+- `duration_seconds` se mide con `ffprobe` sobre el archivo ya escrito a disco, justo antes de responder — `null` si `ffprobe` falla (no bloquea el upload).
+- **Campo opcional `callback_url`** (texto plano, después del campo de archivo en el mismo multipart): si se manda y tiene esquema `http`/`https`, el servidor hace un POST best-effort a esa URL cuando el job termina — ver "Webhook (`callback_url`)" más abajo. Cualquier otro campo con otro nombre se ignora.
 - Límite explícito de **1 GiB** (`router::UPLOAD_BODY_LIMIT_BYTES`, `DefaultBodyLimit::max(...)` aplicado solo a esta ruta, corregido 2026-07-31 — antes corría con el default de Axum, 2 MiB, que truncaba en silencio cualquier audio real de más de un par de minutos). El límite no implica bufferear en RAM: el archivo se sigue escribiendo a disco en streaming, chunk por chunk (`campo.chunk().await` + `write_all` por chunk), nunca se buferea completo en memoria — 1 GiB deja margen cómodo incluso para el caso más pesado hoy soportado (`.wav` PCM sin comprimir, ~550MB para 5h a 16kHz mono).
 
 ### Respuestas
@@ -78,10 +91,23 @@ Sube un archivo de audio, crea un job nuevo (`job_id` UUID v4) y dispara el pipe
 ```bash
 curl -i -X POST http://localhost:3000/api/upload-audio \
   -F "file=@sample_Media/Muestra2_02min.m4a;type=audio/mp4" \
-  -F "title=Reunión de planificación — sprint 12"
+  -F "title=Reunión de planificación — sprint 12" \
+  -F "callback_url=http://localhost:4321/api/hooks/job-status"
 ```
 
-`title` es opcional (se puede omitir el `-F "title=..."` sin problema) y puede ir antes o después de `-F "file=..."` en el comando — el orden de los `-F` en curl no importa para el servidor.
+`title` y `callback_url` son ambos opcionales (se puede omitir cualquiera de los dos `-F` sin problema) y pueden ir en cualquier orden respecto de `-F "file=..."` — el servidor despacha cada campo del multipart por nombre a medida que llega, no asume que el archivo sea siempre el primero.
+
+---
+
+## Webhook (`callback_url`)
+
+Mecanismo de notificación saliente opcional, pensado para que un cliente web sepa cuándo un job termina sin tener que pollear `GET /api/jobs/{job_id}` en un intervalo fijo. Persistido en `JobMetadata::callback_url` (`Option<String>`, `null` si no se configuró).
+
+- **Cómo se configura**: campo `callback_url` del multipart en `POST /api/upload-audio`, o body JSON `{"callback_url": "..."}` en `POST /api/jobs/{job_id}/resume` (ver ahí). Solo se acepta esquema `http`/`https` — cualquier otro valor se ignora y se loguea (`tracing::warn!`), nunca hace fallar el upload/resume.
+- **Cuándo dispara**: exactamente dos veces por corrida de `lanzar_procesamiento_job` — cuando `job.json.status` pasa a `Completed` o a `Failed` (nunca en transiciones intermedias como `Processing`, ni por chunk). Si el job se reanuda y vuelve a fallar/completar, dispara de nuevo.
+- **Qué manda**: `POST {callback_url}` con body JSON `{"job_id": "<uuid>", "status": "Completed"}` (o `"Failed"`), `Content-Type: application/json`.
+- **Garantías — deliberadamente débiles**: un único intento, timeout de 5s, sin cola de reintentos (mismo criterio ya aceptado en el proyecto para Fase 4/resumen — ver `docs/TODO.md`). Si `callback_url` no responde o responde con error, se loguea (`tracing::warn!`) y no se reintenta. `GET /api/jobs/{job_id}` sigue siendo la fuente de verdad autoritativa — el webhook es un complemento de UX en tiempo real, no un mecanismo de entrega garantizada.
+- **Riesgo de SSRF aceptado, no mitigado con allowlisting de hosts**: `callback_url` es una URL provista por el cliente a la que el servidor hace una petición saliente. Aceptable en este proyecto local-first de un solo usuario, no pensado para exponerse a callers no confiables — mismo criterio de riesgo aceptado que el bearer token opcional (ver "Autenticación" más abajo). Si el servidor alguna vez se expone a callers no confiables, esto necesita revisarse.
 
 ---
 
@@ -93,7 +119,7 @@ Deliberadamente **no** existe como tool MCP (ver `CLAUDE.local.md`: "MCP de solo
 
 ### Request
 
-- Sin body.
+- Body opcional: JSON `{"callback_url": "http://..."}` (ver "Webhook" más arriba). Sin body, se mantiene el `callback_url` que el job ya tenía (si tenía uno) — no lo borra. Un body presente pero mal formado se ignora (se loguea), el resume sigue adelante igual.
 - `job_id` como path param — se valida como UUID bien formado (`Uuid::parse_str`) **antes** de tocar el filesystem. Esto también cierra path traversal: un `job_id` como `../../etc` nunca llega a construirse en una ruta de disco.
 
 ### Respuestas
@@ -143,7 +169,7 @@ Lista todos los jobs — equivalente REST de la tool MCP `list_audios`. Reusa `a
     }
   ]
   ```
-  A diferencia de `list_audios`/`get_audio_metadata` de MCP, **no** incluye `audio_path`/`transcript_path`/`checkpoint_path` (rutas de disco del servidor) — filtrado desde el día uno para este endpoint. Sin paginación. `processing_started_at`/`transcript_ready_at`/`completed_at` (agregados 2026-07-31, epoch-segundos como string, `null` si esa fase todavía no ocurrió) permiten calcular cuánto tardó cada fase — ver `CLAUDE.local.md`: logger de métricas. `summary_status`/`summary` (agregados 2026-08-01): `summary_status` es uno de `NotStarted | Generating | Ready | Failed`; `summary` trae el texto del resumen solo cuando `summary_status == "Ready"`, `null` en cualquier otro caso — ver `CLAUDE.local.md`: "Resumen por audio". `original_filename`/`duration_seconds` (agregados 2026-08-04) y `title` (agregado 2026-08-04, ver `POST /api/upload-audio` más abajo): `title` es `null` si el cliente no mandó el campo — el orden de fallback sugerido para el dashboard es `title ?? original_filename ?? job_id`.
+  A diferencia de `list_audios`/`get_audio_metadata` de MCP, **no** incluye `audio_path`/`transcript_path`/`checkpoint_path` (rutas de disco del servidor) — filtrado desde el día uno para este endpoint. Sin paginación. `processing_started_at`/`transcript_ready_at`/`completed_at` (agregados 2026-07-31, epoch-segundos como string, `null` si esa fase todavía no ocurrió) permiten calcular cuánto tardó cada fase — ver `CLAUDE.local.md`: logger de métricas. `summary_status`/`summary` (agregados 2026-08-01): `summary_status` es uno de `NotStarted | Generating | Ready | Failed`; `summary` trae el texto del resumen solo cuando `summary_status == "Ready"`, `null` en cualquier otro caso — ver `CLAUDE.local.md`: "Resumen por audio". `original_filename`/`duration_seconds` (agregados 2026-08-03, para el cliente web: nombre de archivo original y duración total en segundos, ambos `null` si no se pudieron determinar — sin `filename` en el multipart, o `ffprobe` falló) y `title` (agregado 2026-08-04, ver `POST /api/upload-audio` más arriba): `title` es `null` si el cliente no mandó el campo — el orden de fallback sugerido para el dashboard es `title ?? original_filename ?? job_id`. **No** incluye `callback_url` — es un detalle operativo del webhook, no algo que el cliente necesite leer de vuelta (siempre manda la misma URL fija si quiere notificaciones).
 
 ### `GET /api/jobs/{job_id}`
 
@@ -360,7 +386,8 @@ Devuelve el transcript **completo** de un audio (no un resumen ni un retrieval t
   "summary_status": "NotStarted",
   "original_filename": "reunion_planificacion.m4a",
   "duration_seconds": 5423.7,
-  "title": "Reunión de planificación — sprint 12"
+  "title": "Reunión de planificación — sprint 12",
+  "callback_url": null
 }
 ```
 
@@ -369,6 +396,7 @@ Devuelve el transcript **completo** de un audio (no un resumen ni un retrieval t
 - `transcript_ready` (agregado 2026-07-30, `#[serde(default)] = false` para compatibilidad con `job.json` viejos sin el campo): `true` en cuanto Fase 2/3 (Whisper + persistencia) termina bien, independiente de si Fase 4 (embeddings) todavía está en curso o falla después.
 - `created_at` es un epoch en segundos, serializado como **string**, no número.
 - `original_filename`/`duration_seconds` (agregados 2026-08-03, PR "job-title-and-duration") y `title` (agregado 2026-08-04) — los tres `null`/ausentes hasta que se pueblen (ver `POST /api/upload-audio` más arriba para `title`; `duration_seconds` se mide con `ffprobe` justo antes de responder `202`). Este bullet corrige un gap real: estos tres campos ya existían/existen en `JobMetadata` pero este schema no los reflejaba desde que se agregaron los dos primeros.
+- `callback_url` (agregado 2026-08-03, ver "Webhook (`callback_url`)" más arriba) — a diferencia de `original_filename`/`duration_seconds`/`title`, **no** aparece en `JobSummary` (`GET /api/jobs`), solo en este schema completo de `list_audios`/`get_audio_metadata`: es un detalle operativo del webhook, no algo que un cliente necesite leer de vuelta.
 - Los endpoints REST (`GET /api/jobs`, `GET /api/jobs/{job_id}`) devuelven un `JobSummary` filtrado (sin las 3 rutas de disco) en vez de este schema completo — ver sección propia más arriba. `list_audios`/`get_audio_metadata` de MCP siguen devolviendo el `JobMetadata` completo, con las rutas de disco sin filtrar (ver "Gaps conocidos").
 
 ---
@@ -404,7 +432,7 @@ Devuelve el transcript **completo** de un audio (no un resumen ni un retrieval t
 Extraído de `docs/TODO.md` y verificado contra el código actual — listado acá porque afecta directamente qué puede hacer un cliente HTTP/MCP hoy:
 
 - **`list_audios`/`get_audio_metadata` de MCP exponen rutas de disco del servidor** (`audio_path`/`transcript_path`/`checkpoint_path`) sin filtrar. No es una fuga de secretos, pero es estructura interna innecesaria para un cliente remoto. Los endpoints REST equivalentes (`GET /api/jobs`, `GET /api/jobs/{job_id}`) ya filtran esos campos desde el día uno — este gap sigue existiendo solo en el lado MCP.
-- **Sin CORS configurado**: ni en `/mcp` ni en los endpoints REST nuevos — si el cliente web futuro los llama directo desde JS del browser (no a través de un backend propio), va a necesitar headers CORS (`Access-Control-Allow-Origin`, exponer `Mcp-Session-Id` para `/mcp`) que hoy no existen en el router.
+- **CORS resuelto para los endpoints `/api/*` y `GET /health`** (`CorsLayer`, ver "Arranque del servidor" arriba) — **sigue sin resolver para `/mcp`**: el cliente web no lo llama directo (usa los wrappers REST), así que no se le agregó CORS ni se expuso `Mcp-Session-Id`; un cliente MCP genérico corriendo en un browser distinto seguiría necesitando esto.
 - **`allowed_hosts` de `rmcp` limitado a `localhost`/`127.0.0.1`/`::1`** (default del SDK, protección anti DNS-rebinding): un cliente conectando por la IP de LAN real recibe `403 Forbidden` hasta que se amplíe explícitamente con `.with_allowed_hosts([...])`. Solo afecta a `/mcp` (transporte `rmcp`), no a los endpoints `/api/*` (Axum plano, sin ese chequeo). Relevante ni bien se pruebe el servidor desde otro dispositivo en la misma red.
 - **Bearer token opcional, no obligatorio** — y el servidor ya bindea `0.0.0.0` (ver "Arranque del servidor"). Antes de probar desde otro dispositivo en la LAN, como mínimo setear `MCP_BEARER_TOKEN` (cubre `/mcp` y los endpoints REST protegidos por igual, ver "Autenticación").
 - **"Jobs atascados"**: si el proceso completo del servidor muere a mitad de una transcripción (no un `Err` capturado dentro de Rust, sino el binario cayendo), ningún código marca el job como `Failed` — queda en `Processing` indefinidamente. Detectar esto por `mtime` de `checkpoint.json` está documentado como enfoque en `docs/TODO.md`, sin umbral fijado ni implementado todavía.

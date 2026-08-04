@@ -1,0 +1,97 @@
+### Peticiones de ejemplo para los endpoints REST nuevos bajo /api/* (ver docs/api_reference.md).
+### Requiere la extensión "REST Client" de VSCode (humao.rest-client).
+###
+### Uso: con el servidor corriendo (`cargo run`) y al menos un job ya subido (ver
+### `POST /api/upload-audio` en docs/api_reference.md — no tiene .http propio todavía, usar el
+### ejemplo curl de ahí), abrí este archivo en VSCode y hacé click en "Send Request" arriba de
+### cada bloque. La petición 1 (GET /api/jobs) no necesita ningún dato previo — usala para sacar
+### un job_id real y pegalo en @jobId más abajo antes de correr el resto.
+###
+### Los 5 endpoints de este archivo comparten el mismo middleware de bearer token que /mcp: si el
+### servidor arrancó con MCP_BEARER_TOKEN seteado, completá @token y descomentá el header
+### "Authorization" en cada petición (si no, quedan sin autenticar).
+
+@baseUrl = http://localhost:3000
+@token =
+@jobId = 6be8a34c-2619-486d-ae29-98e0c6a028c8
+
+### Subir un archivo
+POST {{{baseUrl}}}/api/upload-audio
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="file"; filename="Muestra22_08min.mp3"
+Content-Type: audio/mp4
+
+< ../sample_Media/Muestra22_08min.mp3
+------WebKitFormBoundary7MA4YWxkTrZu0gW--
+
+### 1. GET /api/jobs — lista todos los jobs (job_id, status, transcript_ready, created_at, sin
+### rutas de disco). Sin esto no hay forma de conseguir un job_id real para las peticiones
+### siguientes si todavía no subiste ningún audio con POST /api/upload-audio.
+# @name listarJobs
+GET {{baseUrl}}/api/jobs
+# Authorization: Bearer {{token}}
+
+### 2. GET /api/jobs/{job_id} — status + progreso de un job puntual (incluye last_chunk/
+### processed_seconds leídos de checkpoint.json). 200 siempre que el job exista, sea cual sea su
+### status; 404 si no existe o el job_id no es un UUID válido.
+GET {{baseUrl}}/api/jobs/{{jobId}}
+# Authorization: Bearer {{token}}
+
+### 2b. GET /api/jobs/{job_id} — caso 404, job_id con formato de UUID pero inexistente.
+GET {{baseUrl}}/api/jobs/00000000-0000-0000-0000-000000000000
+# Authorization: Bearer {{token}}
+
+### 3. GET /api/jobs/{job_id}/transcript — contenido de transcript.jsonl. Siempre 200 si el job
+### existe (aunque el pipeline todavía no haya escrito nada: entries queda en []) — el cliente
+### mira status/transcript_ready en el body, no el código HTTP.
+GET {{baseUrl}}/api/jobs/{{jobId}}/transcript
+# Authorization: Bearer {{token}}
+
+### 4. POST /api/search, scope "audio" — retrieval puro (sin generación) dentro de un solo
+### job_id/audio_id. Wrapper REST de la tool MCP search_transcript.
+POST {{baseUrl}}/api/search
+Content-Type: application/json
+# Authorization: Bearer {{token}}
+
+{
+  "query": "¿hablaron sobre el presupuesto?",
+  "scope": "audio",
+  "audio_id": "{{jobId}}"
+}
+
+### 5. POST /api/search, scope "all_corpus" — busca en todas las reuniones y activa el reranker
+### de cross-encoder. Más lento la primera vez (descarga BAAI/bge-reranker-v2-m3 si todavía no
+### está en la cache de Hugging Face).
+POST {{baseUrl}}/api/search
+Content-Type: application/json
+# Authorization: Bearer {{token}}
+
+{
+  "query": "¿de qué hablaron sobre el presupuesto?",
+  "scope": "all_corpus"
+}
+
+### 6. POST /api/rag/answer, scope "audio" — retrieval + generación vía Ollama
+### (qcwind/qwen2.5-7b-instruct). Puede tardar varios segundos: modelo de 7-8B en CPU. Wrapper
+### REST de la tool MCP rag_answer.
+POST {{baseUrl}}/api/rag/answer
+Content-Type: application/json
+# Authorization: Bearer {{token}}
+
+{
+  "question": "Hablan de fechas limites?",
+  "scope": "audio",
+  "audio_id": "{{jobId}}"
+}
+
+### 7. POST /api/rag/answer, scope "all_corpus" — mismo aviso de latencia que 6, más el costo del
+### reranker (ver petición 5).
+POST {{baseUrl}}/api/rag/answer
+Content-Type: application/json
+# Authorization: Bearer {{token}}
+
+{
+  "question": "¿Cuál es el presupuesto del proyecto?",
+  "scope": "all_corpus"
+}

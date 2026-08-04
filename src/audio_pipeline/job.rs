@@ -27,10 +27,12 @@ static JOB_METADATA_LOCK: Mutex<()> = Mutex::new(());
 /// sniffing magic bytes, never taken verbatim from user input) since it is used as part of a
 /// disk path. `original_filename` is untrusted client input too, but unlike `extension` it is
 /// never used to build a path — it's stored as plain data for the web client (see
-/// `JobMetadata::original_filename`). `title` is not a parameter here: it can only come from a
-/// multipart field read *after* the file field has been fully consumed (see
-/// `handlers::audio_handler::recibir_y_procesar_audio`), so it's always `None` at creation time
-/// and set afterward via `update_job_metadata` — same pattern as `duration_seconds`.
+/// `JobMetadata::original_filename`). `title`/`callback_url` are not parameters here: the job_id
+/// (needed to open the audio file on disk) has to exist before either of those optional multipart
+/// fields is necessarily known — the caller (`handlers::audio_handler::recibir_y_procesar_audio`)
+/// reads every field of the multipart generically as it arrives, so `title`/`callback_url` can
+/// land before or after the file field with no fixed order. Both are always `None` at creation
+/// time and set afterward via `update_job_metadata` — same pattern as `duration_seconds`.
 pub fn create_job(
     extension: &str,
     original_filename: Option<String>,
@@ -58,6 +60,7 @@ pub fn create_job(
         original_filename,
         duration_seconds: None,
         title: None,
+        callback_url: None,
     };
 
     let job_json_path = job_dir.join("job.json");

@@ -5,12 +5,35 @@ use crate::state::SharedState;
 use axum::{
     Router,
     extract::{DefaultBodyLimit, Request, State},
-    http::{StatusCode, header::AUTHORIZATION},
+    http::{
+        HeaderValue, Method, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    },
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use std::sync::Arc;
+use tower_http::cors::CorsLayer;
+
+/// `GET /health` — sin autenticación, a propósito: el cliente web lo necesita para distinguir
+/// "backend caído/no alcanzable" de "token inválido" antes incluso de mostrar el login. También
+/// expone si hay una carga pesada (Whisper o una consulta RAG) corriendo ahora mismo
+/// (`heavy_compute_semaphore.available_permits() == 0`), para que el cliente pueda avisar "el
+/// servidor está ocupado, la respuesta puede tardar" antes de mandar una consulta RAG — ver
+/// `docs/know_flaws.md` (punto 3, saber si el semáforo está ocupado).
+#[derive(Debug, serde::Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    heavy_compute_busy: bool,
+}
+
+async fn healthcheck(State(estado): State<SharedState>) -> impl IntoResponse {
+    axum::Json(HealthResponse {
+        status: "ok",
+        heavy_compute_busy: estado.heavy_compute_semaphore.available_permits() == 0,
+    })
+}
 
 /// Límite explícito de tamaño de body para `POST /api/upload-audio` — el default de Axum
 /// (`DefaultBodyLimit`, 2 MiB) truncaba en silencio cualquier audio real de este proyecto (audios
@@ -103,17 +126,41 @@ fn crear_router_protegido(estado: SharedState) -> Router {
         ))
 }
 
+/// Origen permitido para CORS (`CLIENT_ORIGIN`, ver `config.rs`) — parseado una sola vez al armar
+/// el router. Un valor mal formado en `.env` cae al default (`http://localhost:4321`) en vez de
+/// hacer panic al arrancar el servidor; se loguea para que no pase desapercibido.
+fn cors_layer() -> CorsLayer {
+    let origen = &crate::config::get().services.client_origin;
+    let origen = origen.parse::<HeaderValue>().unwrap_or_else(|e| {
+        tracing::warn!(
+            "CLIENT_ORIGIN '{origen}' no es un origen HTTP válido ({e}), usando el default"
+        );
+        HeaderValue::from_static("http://localhost:4321")
+    });
+
+    CorsLayer::new()
+        .allow_origin(origen)
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+}
+
 pub fn crear_router(estado: SharedState) -> Router {
     let upload = Router::new()
         .route("/api/upload-audio", post(recibir_y_procesar_audio))
         .layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT_BYTES))
         .with_state(estado.clone());
 
+    let salud = Router::new()
+        .route("/health", get(healthcheck))
+        .with_state(estado.clone());
+
     Router::new()
         .route("/api/jobs/{job_id}/resume", post(reanudar_job))
         .with_state(estado.clone())
         .merge(upload)
+        .merge(salud)
         .merge(crear_router_protegido(estado))
+        .layer(cors_layer())
 }
 
 #[cfg(test)]
@@ -154,6 +201,66 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `GET /health` no requiere `Authorization` (a diferencia de `GET /api/jobs` y el resto de
+    /// los endpoints protegidos) — el cliente lo necesita para distinguir "backend caído" de
+    /// "token inválido" antes de mostrar el login.
+    #[tokio::test]
+    async fn get_health_devuelve_ok_sin_autenticacion() {
+        let app = crear_router(estado_de_prueba());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["status"], "ok");
+        // El semáforo de prueba tiene 1 permiso y nada lo tomó todavía en este test.
+        assert_eq!(json["heavy_compute_busy"], false);
+    }
+
+    /// Confirma que el `CorsLayer` responde el preflight `OPTIONS` con los headers que el
+    /// cliente web necesita para poder hacer `fetch()` desde otro origen — sin esto, el browser
+    /// bloquea la request antes de que llegue al handler real, aunque el servidor la aceptaría.
+    #[tokio::test]
+    async fn preflight_cors_responde_con_headers_de_acceso() {
+        let app = crear_router(estado_de_prueba());
+        let origen = crate::config::get().services.client_origin.clone();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/jobs")
+                    .header("origin", &origen)
+                    .header("access-control-request-method", "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some(origen.as_str())
+        );
     }
 
     #[tokio::test]
@@ -575,6 +682,77 @@ mod tests {
 
         let metadata = crate::audio_pipeline::job::load_job(&job_id).expect("job.json ilegible");
         assert_eq!(metadata.title.as_deref(), Some("Reunión de planificación"));
+
+        let _ = std::fs::remove_dir_all(format!("./jobs/{job_id}"));
+    }
+
+    /// Bug real encontrado en la sesión donde se agregó `callback_url`: con el diseño original
+    /// (un único campo de archivo leído por fuera de cualquier loop, seguido de un segundo `while`
+    /// para los campos restantes), sin un `drop(campo)` explícito después de agotar el campo del
+    /// archivo, `Multipart::next_field()` fallaba en silencio con "Error parsing
+    /// `multipart/form-data` request" al pedir el siguiente campo — `callback_url` nunca se leía
+    /// ni se persistía (verificado manualmente contra el servidor real antes del fix). Tras el
+    /// merge con el soporte de `title`, el handler pasó a un único `loop` genérico donde cada
+    /// `campo` vive scoped a su iteración — el mismo problema queda evitado por construcción, sin
+    /// necesitar ningún `drop` explícito (ver comentario en `recibir_y_procesar_audio`). Este test
+    /// sigue siendo la regresión que cubre el escenario real: un multipart con el campo de
+    /// archivo seguido de `callback_url`, tal como lo arma `UploadForm` en el cliente web.
+    #[tokio::test]
+    async fn upload_con_callback_url_lo_persiste_en_job_json() {
+        let _guard = crate::audio_pipeline::job::JOBS_DIR_TEST_LOCK.lock().await;
+
+        let app = crear_router(estado_de_prueba());
+        let boundary = "TESTBOUNDARYCALLBACK";
+        // Header WAV válido (pasa el sniff de magic bytes) pero sin datos reales — no hace falta
+        // que decodifique bien, esto solo prueba el parseo de los campos del multipart, no el
+        // pipeline de Whisper.
+        let wav_minimo: &[u8] = b"RIFF\x24\x08\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\
+             \x80\xBB\x00\x00\x00\xEE\x02\x00\x02\x00\x10\x00data\x00\x08\x00\x00";
+
+        let mut body =
+            construir_cuerpo_multipart(boundary, "callback.wav", "audio/wav", wav_minimo);
+        // `construir_cuerpo_multipart` ya cierra el body con el boundary final — hay que sacarle
+        // ese cierre para poder agregar el campo `callback_url` y recién ahí volver a cerrarlo.
+        let cierre = format!("--{boundary}--\r\n");
+        assert!(body.ends_with(cierre.as_bytes()));
+        body.truncate(body.len() - cierre.len());
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"callback_url\"\r\n\r\n");
+        body.extend_from_slice(b"http://127.0.0.1:9/webhook-test");
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(cierre.as_bytes());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/upload-audio")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let body_bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let job_id = json["job_id"].as_str().unwrap().to_string();
+
+        // `callback_url` se persiste sincrónicamente en el handler, antes de disparar el
+        // procesamiento en background — ya está en disco para cuando llega la respuesta 202, sin
+        // necesidad de esperar ni pollear.
+        let job_json_path = format!("./jobs/{job_id}/job.json");
+        let contenido = std::fs::read_to_string(&job_json_path).expect("job.json debería existir");
+        let job_json: serde_json::Value = serde_json::from_str(&contenido).unwrap();
+        assert_eq!(job_json["callback_url"], "http://127.0.0.1:9/webhook-test");
 
         let _ = std::fs::remove_dir_all(format!("./jobs/{job_id}"));
     }
