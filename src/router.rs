@@ -284,7 +284,7 @@ mod tests {
         let _guard = crate::audio_pipeline::job::JOBS_DIR_TEST_LOCK.lock().await;
 
         let metadata =
-            crate::audio_pipeline::job::create_job("wav").expect("no se pudo crear el job");
+            crate::audio_pipeline::job::create_job("wav", None).expect("no se pudo crear el job");
         let app = crear_router(estado_de_prueba());
 
         let response = app
@@ -335,7 +335,7 @@ mod tests {
         let _guard = crate::audio_pipeline::job::JOBS_DIR_TEST_LOCK.lock().await;
 
         let metadata =
-            crate::audio_pipeline::job::create_job("wav").expect("no se pudo crear el job");
+            crate::audio_pipeline::job::create_job("wav", None).expect("no se pudo crear el job");
         let app = crear_router(estado_de_prueba());
 
         let response = app
@@ -385,7 +385,7 @@ mod tests {
         let _guard = crate::audio_pipeline::job::JOBS_DIR_TEST_LOCK.lock().await;
 
         let metadata =
-            crate::audio_pipeline::job::create_job("wav").expect("no se pudo crear el job");
+            crate::audio_pipeline::job::create_job("wav", None).expect("no se pudo crear el job");
         let app = crear_router(estado_de_prueba());
 
         // end <= start

@@ -44,6 +44,12 @@ pub struct JobSummary {
     /// Contenido de `summary.txt`, leído solo cuando `summary_status == Ready` — `None` en
     /// cualquier otro caso (nunca un endpoint separado para esto, alcanza con este campo).
     pub summary: Option<String>,
+    /// Ver `JobMetadata::original_filename` — nombre de archivo original del multipart, `None`
+    /// si el cliente no lo mandó. Nunca es una ruta de disco.
+    pub original_filename: Option<String>,
+    /// Ver `JobMetadata::duration_seconds` — `None` hasta que `ffprobe` termine de medirlo (o si
+    /// falló al medirlo).
+    pub duration_seconds: Option<f32>,
 }
 
 impl From<&JobMetadata> for JobSummary {
@@ -73,6 +79,8 @@ impl From<&JobMetadata> for JobSummary {
             completed_at: metadata.completed_at.clone(),
             summary_status: metadata.summary_status,
             summary,
+            original_filename: metadata.original_filename.clone(),
+            duration_seconds: metadata.duration_seconds,
         }
     }
 }

@@ -25,8 +25,13 @@ static JOB_METADATA_LOCK: Mutex<()> = Mutex::new(());
 ///
 /// `extension` must already be a trusted, validated value (e.g. "mp3" or "mp4" derived from
 /// sniffing magic bytes, never taken verbatim from user input) since it is used as part of a
-/// disk path.
-pub fn create_job(extension: &str) -> anyhow::Result<JobMetadata> {
+/// disk path. `original_filename` is untrusted client input too, but unlike `extension` it is
+/// never used to build a path — it's stored as plain data for the web client to show as a
+/// "title" (see `JobMetadata::original_filename`).
+pub fn create_job(
+    extension: &str,
+    original_filename: Option<String>,
+) -> anyhow::Result<JobMetadata> {
     let job_id = Uuid::new_v4().to_string();
     let job_dir = crate::config::get().paths.jobs_dir.join(&job_id);
     fs::create_dir_all(&job_dir)?;
@@ -47,6 +52,8 @@ pub fn create_job(extension: &str) -> anyhow::Result<JobMetadata> {
         transcript_ready_at: None,
         completed_at: None,
         summary_status: SummaryStatus::default(),
+        original_filename,
+        duration_seconds: None,
     };
 
     let job_json_path = job_dir.join("job.json");
@@ -153,7 +160,7 @@ mod tests {
     async fn update_job_metadata_concurrente_no_corrompe_job_json() {
         let _guard = JOBS_DIR_TEST_LOCK.lock().await;
 
-        let metadata = create_job("wav").expect("no se pudo crear el job de prueba");
+        let metadata = create_job("wav", None).expect("no se pudo crear el job de prueba");
         let job_id = metadata.job_id.clone();
 
         let mut handles = Vec::new();
