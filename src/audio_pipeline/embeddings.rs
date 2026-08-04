@@ -111,6 +111,12 @@ pub async fn run_embedding_phase(
                 entry.chunk
             )
         })?;
+        tracing::debug!(
+            audio_id,
+            chunk = entry.chunk,
+            embedding_dim = embedding.len(),
+            "Ollama devolvió el embedding del chunk"
+        );
 
         let point_id = deterministic_point_id(audio_id, entry.chunk);
         let payload: Payload = serde_json::json!({
@@ -124,10 +130,16 @@ pub async fn run_embedding_phase(
         })
         .try_into()?;
 
-        let point = PointStruct::new(point_id, embedding, payload);
+        let point = PointStruct::new(point_id.clone(), embedding, payload);
         qdrant
             .upsert_points(UpsertPointsBuilder::new(COLLECTION_NAME, vec![point]))
             .await?;
+        tracing::debug!(
+            audio_id,
+            chunk = entry.chunk,
+            point_id,
+            "Qdrant confirmó el upsert del punto"
+        );
     }
 
     Ok(())

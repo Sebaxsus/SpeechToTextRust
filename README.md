@@ -143,6 +143,9 @@ docker run -d --name qdrant_local \
 
 Verificar: `curl http://127.0.0.1:6333/collections` debe responder `200`.
 
+Para revisar/administrar la instancia ya corriendo (dashboard web, ver los vectores guardados,
+entender qué significa cada campo) ver [`docs/qdrant.md`](docs/qdrant.md).
+
 ### 6. Reranker (candle + Hugging Face Hub)
 
 No requiere instalación manual: la primera vez que corre código que usa `SearchScope::AllCorpus` (incluyendo el test de integración del reranker), `hf-hub` descarga automáticamente `tokenizer.json`, `config.json` y `model.safetensors` de `BAAI/bge-reranker-v2-m3` (~2.2GB) y los cachea en `~/.cache/huggingface/hub`. Necesita red esa única vez; corridas siguientes son 100% offline.
@@ -160,6 +163,21 @@ POST /api/upload-audio   (multipart/form-data, campo de archivo mp3/mp4)
 ```
 
 La Fase 5 (RAG) todavía no tiene endpoint HTTP propio — se prueba directamente vía los tests de integración descritos abajo, hasta que la Fase 6 (MCP) los conecte.
+
+### Logs
+
+Por consola se ven solo los eventos importantes (arranque, transiciones de estado de un job — "transcribiendo", "resumiendo", "generando embeddings/resumen", "enviando el estado" — y cualquier warning/error). El detalle completo (métricas por chunk de Whisper, lo que devuelven Ollama y Qdrant en cada llamada) siempre queda en `logs/server.YYYY-MM-DD.log` (rotación diaria), sin importar cómo se corra el servidor:
+
+```bash
+cargo run             # consola curada + logs/server.<fecha>.log completo
+cargo run -- --log    # consola también muestra todo el detalle (DEBUG), útil para debugging en vivo
+```
+
+Ver `docs/Arquitechture.md` (sección "Observabilidad y operación") para el diseño del logger.
+
+### Cerrar el servidor
+
+`CTRL+C` hace un shutdown prolijo: cierra las sesiones MCP abiertas y deja terminar las requests HTTP en curso antes de salir. Si había una transcripción de Whisper en curso, el chunk que estaba procesándose en ese momento se pierde (no hay forma de cancelar CPU-bound a mitad de camino), pero eso ya está cubierto por diseño — `checkpoint.json` solo avanza tras un chunk completo, así que `POST /api/jobs/{job_id}/resume` retoma exactamente ahí.
 
 ## Tests
 
@@ -203,8 +221,9 @@ cargo test
 
 ## Documentación
 
-- [`docs/Arquitechture.md`](docs/Arquitechture.md) — arquitectura y decisiones de diseño por fase.
+- [`docs/Arquitechture.md`](docs/Arquitechture.md) — arquitectura y decisiones de diseño por fase (incluye logger y graceful shutdown, sección "Observabilidad y operación").
 - [`docs/TODO.md`](docs/TODO.md) — trabajo pendiente, priorizado.
 - [`docs/terminology.md`](docs/terminology.md) — glosario de términos (ASR, Nyquist, chunk, tdrz, etc.).
+- [`docs/qdrant.md`](docs/qdrant.md) — cómo revisar/administrar Qdrant a mano (dashboard, comandos `curl`, qué significa cada campo).
 
 Las decisiones técnicas detalladas (params exactos de Whisper, reglas de dedupe de tdrz, límites de RAM) viven en `CLAUDE.local.md`, que es un archivo personal no versionado.

@@ -11,8 +11,9 @@ cliente MCP real (Claude Desktop, etc.) para este flujo — son peticiones HTTP 
 2. Ollama corriendo con `bge-m3` y `qcwind/qwen2.5-7b-instruct-Q4_K_M` ya descargados (`ollama list` para confirmar).
 3. Qdrant corriendo y accesible en `localhost:6334` (gRPC) / `localhost:6333` (REST).
 4. Al menos un audio ya procesado (`./jobs/{job_id}/job.json` + embeddings en Qdrant) si querés
-   probar `search_transcript`, `rag_answer` o `get_audio_metadata` con datos reales — `list_audios`
-   funciona igual sin esto (devuelve una lista vacía).
+   probar `search_transcript`, `rag_answer`, `get_audio_metadata` o `get_transcript` con datos
+   reales — `list_audios` funciona igual sin esto (devuelve una lista vacía). `get_transcript`
+   además necesita que `transcript.jsonl` ya exista (no solo `job.json`), o devuelve `entries: []`.
 5. Levantar el servidor: `cargo run`. La consola imprime la URL del endpoint MCP y si
    `MCP_BEARER_TOKEN` está configurado o no (ver "Autenticación" más abajo).
 
@@ -61,7 +62,7 @@ campo `"id"` ahí adentro es el `id` de JSON-RPC que vos mandaste (`3`, `4`, etc
 el `id: N/N` de la línea de SSE que lo envuelve (eso es un detalle interno del framing, no del
 protocolo MCP).
 
-## Las 4 tools expuestas
+## Las 5 tools expuestas
 
 Definidas en `src/mcp/mod.rs`, todas de solo lectura (nunca escriben ni borran en Qdrant, nunca
 disparan una transcripción):
@@ -72,6 +73,7 @@ disparan una transcripción):
 | `rag_answer` | `question`, `scope` | Retrieval + generación server-side vía Ollama (el motor de RAG por defecto del proyecto). |
 | `list_audios` | (ninguno) | Lista todos los `./jobs/*/job.json`. |
 | `get_audio_metadata` | `audio_id` | Devuelve el `job.json` completo de un audio puntual. |
+| `get_transcript` | `audio_id` | Devuelve el transcript **completo** (no un resumen, no un retrieval top-k) — pensada para que un cliente MCP externo (otro asistente de IA) genere su propio análisis del texto entero. |
 
 ### El campo `scope` es obligatorio, sin default a "buscar todo"
 

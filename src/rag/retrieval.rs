@@ -119,6 +119,11 @@ pub async fn search(
     }
 
     let response = qdrant.query(request).await?;
+    tracing::debug!(
+        scope = ?scope,
+        hits = response.result.len(),
+        "Qdrant devolvió los hits de la búsqueda"
+    );
 
     let mut hits = Vec::with_capacity(response.result.len());
     for scored in response.result {

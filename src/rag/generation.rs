@@ -2,24 +2,29 @@ use ollama_rs::Ollama;
 use ollama_rs::generation::chat::ChatMessage;
 use ollama_rs::generation::chat::request::ChatMessageRequest;
 use ollama_rs::generation::parameters::KeepAlive;
+use ollama_rs::models::ModelOptions;
 use qdrant_client::Qdrant;
 
 use super::retrieval::{ChunkHit, SearchScope, search};
+use crate::rag::LOW_CONFIDENCE_THOLD;
 
 /// Generación por defecto para ambos `SearchScope` (ver CLAUDE.local.md: "Generación — Ollama
 /// por defecto, Gemini Nano opcional") — la prioridad #1 del proyecto es accuracy, no descargar
 /// cómputo a un modelo on-device más liviano.
-const GENERATION_MODEL: &str = "qcwind/qwen2.5-7b-instruct-Q4_K_M:latest";
+pub(crate) const GENERATION_MODEL: &str = "qcwind/qwen2.5-7b-instruct-Q4_K_M:latest";
 /// Top-k dentro del rango 5-8 fijado en CLAUDE.local.md.
 const TOP_K: u64 = 6;
-/// Mismo umbral que `logprob_thold` de Whisper (ver CLAUDE.local.md) — por debajo de esto se
-/// marca el chunk como posible ruido/cross-talk en el contexto que ve el modelo.
-const BAJA_CONFIANZA_THOLD: f32 = -0.8;
+/// El default de Ollama (2048) es fácil de exceder incluso con un contexto ensamblado modesto
+/// (`TOP_K=6` hits + vecinos) — hallazgo real (2026-08-01, ver CLAUDE.local.md): `rag_answer`
+/// nunca seteaba `num_ctx`, con riesgo de truncamiento silencioso del contexto. El modelo
+/// (`qcwind/qwen2.5-7b-instruct-Q4_K_M`) soporta hasta 32768 tokens; 4096 da margen real sin
+/// acercarse a ese techo.
+const RAG_ANSWER_NUM_CTX: u64 = 4096;
 
 fn assemble_context(hits: &[ChunkHit]) -> String {
     let mut context = String::new();
     for hit in hits {
-        let aviso = if hit.chunk.avg_logprob < BAJA_CONFIANZA_THOLD {
+        let aviso = if hit.chunk.avg_logprob < LOW_CONFIDENCE_THOLD {
             " [BAJA CONFIANZA — posible ruido de fondo o cross-talk, ver CLAUDE.local.md]"
         } else {
             ""
@@ -75,9 +80,15 @@ pub async fn rag_answer(
     ];
 
     let request = ChatMessageRequest::new(GENERATION_MODEL.to_string(), messages)
+        .options(ModelOptions::default().num_ctx(RAG_ANSWER_NUM_CTX))
         .keep_alive(KeepAlive::UnloadOnCompletion);
 
     let response = ollama.send_chat_messages(request).await?;
+    tracing::debug!(
+        hits = hits.len(),
+        response_chars = response.message.content.len(),
+        "Ollama devolvió la respuesta de rag_answer"
+    );
 
     Ok(response.message.content)
 }

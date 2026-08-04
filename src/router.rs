@@ -61,9 +61,9 @@ async fn exigir_bearer_token(
 
 /// Router de todo lo que requiere el bearer token de `/mcp` (`MCP_BEARER_TOKEN`): el propio
 /// `/mcp` y los endpoints REST de lectura (`GET /api/jobs`, `GET /api/jobs/{job_id}`,
-/// `GET /api/jobs/{job_id}/transcript`, `GET /api/jobs/{job_id}/metrics`, `POST /api/search`,
-/// `POST /api/rag/answer`) — todos exponen el mismo contenido transcrito sensible, así que
-/// comparten exactamente el mismo
+/// `GET /api/jobs/{job_id}/transcript`, `GET /api/jobs/{job_id}/metrics`,
+/// `GET /api/jobs/{job_id}/audio-segment`, `POST /api/search`, `POST /api/rag/answer`) — todos
+/// exponen el mismo contenido transcrito sensible, así que comparten exactamente el mismo
 /// middleware/token en vez de un segundo mecanismo de auth. `/api/upload-audio` y
 /// `/api/jobs/{id}/resume` (endpoints de escritura ya existentes) quedan fuera de este grupo, sin
 /// cambios.
@@ -89,6 +89,10 @@ fn crear_router_protegido(estado: SharedState) -> Router {
         .route(
             "/api/jobs/{job_id}/metrics",
             get(jobs_handler::obtener_metricas_handler),
+        )
+        .route(
+            "/api/jobs/{job_id}/audio-segment",
+            get(jobs_handler::obtener_segmento_audio_handler),
         )
         .route("/api/search", post(rag_handler::buscar_handler))
         .route("/api/rag/answer", post(rag_handler::rag_answer_handler))
@@ -130,6 +134,7 @@ mod tests {
             qdrant: qdrant_client::Qdrant::from_url("http://localhost:6334")
                 .build()
                 .expect("cliente de Qdrant de prueba"),
+            mcp_cancellation_token: tokio_util::sync::CancellationToken::new(),
         })
     }
 
@@ -350,6 +355,68 @@ mod tests {
             .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(json["entries"].as_array().unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(format!("./jobs/{}", metadata.job_id));
+    }
+
+    #[tokio::test]
+    async fn get_audio_segment_de_job_inexistente_devuelve_404() {
+        let app = crear_router(estado_de_prueba());
+        let job_id = uuid::Uuid::new_v4();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/jobs/{job_id}/audio-segment?start=0&end=10"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// La validación del rango ocurre antes de invocar `ffmpeg` — este test no depende de tener
+    /// un audio real en disco ni el binario de `ffmpeg` instalado.
+    #[tokio::test]
+    async fn get_audio_segment_con_rango_invalido_devuelve_400() {
+        let _guard = crate::audio_pipeline::job::JOBS_DIR_TEST_LOCK.lock().await;
+
+        let metadata =
+            crate::audio_pipeline::job::create_job("wav").expect("no se pudo crear el job");
+        let app = crear_router(estado_de_prueba());
+
+        // end <= start
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/jobs/{}/audio-segment?start=10&end=5",
+                        metadata.job_id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // duración > MAX_SEGMENT_SECONDS
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/jobs/{}/audio-segment?start=0&end=999",
+                        metadata.job_id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let _ = std::fs::remove_dir_all(format!("./jobs/{}", metadata.job_id));
     }
