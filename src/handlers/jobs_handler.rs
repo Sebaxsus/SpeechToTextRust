@@ -50,6 +50,11 @@ pub struct JobSummary {
     /// Ver `JobMetadata::duration_seconds` — `None` hasta que `ffprobe` termine de medirlo (o si
     /// falló al medirlo).
     pub duration_seconds: Option<f32>,
+    /// Ver `JobMetadata::title` — título elegido por el usuario en el campo `title` del
+    /// multipart, `None` si no lo mandó (o si mandó un valor en blanco). El fallback
+    /// `title ?? original_filename ?? job_id` para mostrar en el dashboard es responsabilidad del
+    /// cliente, no se resuelve acá.
+    pub title: Option<String>,
 }
 
 impl From<&JobMetadata> for JobSummary {
@@ -81,6 +86,7 @@ impl From<&JobMetadata> for JobSummary {
             summary,
             original_filename: metadata.original_filename.clone(),
             duration_seconds: metadata.duration_seconds,
+            title: metadata.title.clone(),
         }
     }
 }

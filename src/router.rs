@@ -626,14 +626,77 @@ mod tests {
         assert_eq!(contar_entradas(jobs_dir), jobs_antes);
     }
 
-    /// Bug real encontrado y corregido en esta sesión: sin un `drop(campo)` explícito después de
-    /// agotar el campo del archivo, `Multipart::next_field()` fallaba en silencio con "Error
-    /// parsing `multipart/form-data` request" al pedir el siguiente campo — `callback_url` nunca
-    /// se leía ni se persistía, sin que el upload fallara ni diera ningún indicio del problema
-    /// (verificado manualmente contra el servidor real antes del fix: `job.json` quedaba con
-    /// `callback_url: null` pese a mandarlo en el multipart). Este test cubre exactamente ese
-    /// escenario: un multipart con el campo de archivo seguido de `callback_url`, tal como lo
-    /// arma `UploadForm` en el cliente web (ver plan del cliente).
+    /// El campo `title` se manda ANTES del campo de archivo a propósito — el handler no puede
+    /// asumir que el archivo siempre llega primero en el multipart (ver
+    /// `handlers::audio_handler::recibir_y_procesar_audio`). También ejercita el trim de
+    /// espacios en blanco.
+    #[tokio::test]
+    async fn upload_con_title_antes_del_archivo_lo_persiste_en_job_json() {
+        let _guard = crate::audio_pipeline::job::JOBS_DIR_TEST_LOCK.lock().await;
+
+        let jobs_dir = std::path::Path::new("./jobs");
+        let _ = std::fs::create_dir_all(jobs_dir);
+        let jobs_antes = contar_entradas(jobs_dir);
+
+        let app = crear_router(estado_de_prueba());
+        let boundary = "TESTBOUNDARYTITLE";
+
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"title\"\r\n\r\n");
+        body.extend_from_slice("Reunión de planificación  ".as_bytes());
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: audio/wav\r\n\r\n");
+        body.extend_from_slice(b"RIFF\x24\x08\x00\x00WAVEfmt ");
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/upload-audio")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(contar_entradas(jobs_dir), jobs_antes + 1);
+
+        let body_bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let job_id = json["job_id"].as_str().unwrap().to_string();
+
+        let metadata = crate::audio_pipeline::job::load_job(&job_id).expect("job.json ilegible");
+        assert_eq!(metadata.title.as_deref(), Some("Reunión de planificación"));
+
+        let _ = std::fs::remove_dir_all(format!("./jobs/{job_id}"));
+    }
+
+    /// Bug real encontrado en la sesión donde se agregó `callback_url`: con el diseño original
+    /// (un único campo de archivo leído por fuera de cualquier loop, seguido de un segundo `while`
+    /// para los campos restantes), sin un `drop(campo)` explícito después de agotar el campo del
+    /// archivo, `Multipart::next_field()` fallaba en silencio con "Error parsing
+    /// `multipart/form-data` request" al pedir el siguiente campo — `callback_url` nunca se leía
+    /// ni se persistía (verificado manualmente contra el servidor real antes del fix). Tras el
+    /// merge con el soporte de `title`, el handler pasó a un único `loop` genérico donde cada
+    /// `campo` vive scoped a su iteración — el mismo problema queda evitado por construcción, sin
+    /// necesitar ningún `drop` explícito (ver comentario en `recibir_y_procesar_audio`). Este test
+    /// sigue siendo la regresión que cubre el escenario real: un multipart con el campo de
+    /// archivo seguido de `callback_url`, tal como lo arma `UploadForm` en el cliente web.
     #[tokio::test]
     async fn upload_con_callback_url_lo_persiste_en_job_json() {
         let _guard = crate::audio_pipeline::job::JOBS_DIR_TEST_LOCK.lock().await;
