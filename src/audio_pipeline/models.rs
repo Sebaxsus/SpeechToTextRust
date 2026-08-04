@@ -54,6 +54,21 @@ pub struct JobMetadata {
     /// feature) siga deserializando con `NotStarted`.
     #[serde(default)]
     pub summary_status: SummaryStatus,
+    /// Nombre de archivo original del multipart (`campo.file_name()`), guardado como dato plano
+    /// para mostrar un "título" en el cliente web — **nunca** se usa para construir una ruta de
+    /// disco (el archivo real siempre vive en `audio_path`, derivado del `job_id`), así que no
+    /// reintroduce el riesgo de path traversal que Fase 1 ya evitó para este mismo valor.
+    /// `None` si el cliente no mandó ningún `filename` en el multipart. `#[serde(default)]` para
+    /// que un `job.json` viejo siga deserializando.
+    #[serde(default)]
+    pub original_filename: Option<String>,
+    /// Duración total del audio en segundos, medida con `ffprobe` sobre el archivo ya escrito a
+    /// disco, justo antes de responder `202` en `recibir_y_procesar_audio` — es una llamada corta
+    /// (mismo binario que ya usa el fallback de `decoder.rs`), así que no vale la pena moverla a
+    /// background solo por eso. `None` si `ffprobe` falla (no bloquea ni falla el upload por
+    /// esto) o para `job.json` viejos sin este campo.
+    #[serde(default)]
+    pub duration_seconds: Option<f32>,
 }
 
 impl JobMetadata {

@@ -12,6 +12,53 @@ use axum::{
 };
 use tokio::io::AsyncWriteExt;
 
+/// Mide la duración total del audio con `ffprobe` (mismo binario que ya requiere el fallback de
+/// `decoder.rs`, ver `CLAUDE.local.md`) — `tokio::process::Command` async, no la variante sync
+/// que usa `decoder.rs`, porque acá corre dentro de un handler de Axum, no de un
+/// `spawn_blocking`. `None` en cualquier falla (binario ausente, salida inesperada): nunca hace
+/// fallar el upload por esto, solo deja `duration_seconds` sin poblar.
+async fn probe_duration_seconds(audio_path: &str) -> Option<f32> {
+    let output = tokio::process::Command::new(&crate::config::get().paths.ffprobe_bin)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            audio_path,
+        ])
+        .output()
+        .await;
+
+    let output = match output {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            tracing::warn!(
+                "ffprobe no pudo leer la duración de {audio_path}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!("no se pudo ejecutar ffprobe para {audio_path}: {e}");
+            return None;
+        }
+    };
+
+    let json: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(json) => json,
+        Err(e) => {
+            tracing::warn!("salida de ffprobe ilegible para {audio_path}: {e}");
+            return None;
+        }
+    };
+
+    json["format"]["duration"]
+        .as_str()
+        .and_then(|s| s.parse::<f32>().ok())
+}
+
 /// Detecta el contenedor real a partir de los primeros bytes del archivo (magic bytes), en vez
 /// de confiar en la extensión declarada por el cliente. Devuelve la extensión interna ("mp3" /
 /// "mp4" / "wav") que se usa después para el nombre de archivo en disco, o `None` si no es un
@@ -50,7 +97,10 @@ pub async fn recibir_y_procesar_audio(
             .into_response();
     };
 
-    let nombre_archivo = campo.file_name().unwrap_or("audio_desconocido").to_string();
+    // `None` si el cliente no mandó ningún `filename` en el multipart — se persiste tal cual
+    // (ver `JobMetadata::original_filename`), en vez de rellenarlo con un placeholder que
+    // terminaría guardado como si fuera un nombre real.
+    let nombre_archivo = campo.file_name().map(str::to_string);
 
     // Sniff del primer chunk ANTES de crear cualquier archivo o directorio en disco.
     let primer_chunk = match campo.chunk().await {
@@ -68,7 +118,7 @@ pub async fn recibir_y_procesar_audio(
             .into_response();
     };
 
-    let metadata = match create_job(extension) {
+    let metadata = match create_job(extension, nombre_archivo.clone()) {
         Ok(metadata) => metadata,
         Err(e) => {
             tracing::error!("Error creando el job: {}", e);
@@ -151,9 +201,20 @@ pub async fn recibir_y_procesar_audio(
     tracing::info!(
         target: "lifecycle",
         "Archivo {} guardado exitosamente en el SSD (job {}).",
-        nombre_archivo,
+        nombre_archivo.as_deref().unwrap_or("(sin nombre)"),
         job_id
     );
+
+    // Corto y sincrónico con la respuesta HTTP a propósito (a diferencia de Whisper/embeddings,
+    // que corren en background): el cliente necesita `duration_seconds` disponible desde el
+    // primer `GET /api/jobs` después del 202, no en un estado intermedio "todavía desconocida".
+    // Best-effort: si ffprobe falla, se loguea y el job sigue con `duration_seconds: None` en vez
+    // de fallar el upload por esto.
+    if let Some(duration) = probe_duration_seconds(&metadata.audio_path).await
+        && let Err(e) = update_job_metadata(&job_id, |m| m.duration_seconds = Some(duration))
+    {
+        tracing::error!("No se pudo guardar duration_seconds del job '{job_id}': {e}");
+    }
 
     lanzar_procesamiento_job(state, metadata, false);
 
