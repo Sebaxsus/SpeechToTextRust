@@ -26,8 +26,11 @@ static JOB_METADATA_LOCK: Mutex<()> = Mutex::new(());
 /// `extension` must already be a trusted, validated value (e.g. "mp3" or "mp4" derived from
 /// sniffing magic bytes, never taken verbatim from user input) since it is used as part of a
 /// disk path. `original_filename` is untrusted client input too, but unlike `extension` it is
-/// never used to build a path — it's stored as plain data for the web client to show as a
-/// "title" (see `JobMetadata::original_filename`).
+/// never used to build a path — it's stored as plain data for the web client (see
+/// `JobMetadata::original_filename`). `title` is not a parameter here: it can only come from a
+/// multipart field read *after* the file field has been fully consumed (see
+/// `handlers::audio_handler::recibir_y_procesar_audio`), so it's always `None` at creation time
+/// and set afterward via `update_job_metadata` — same pattern as `duration_seconds`.
 pub fn create_job(
     extension: &str,
     original_filename: Option<String>,
@@ -54,6 +57,7 @@ pub fn create_job(
         summary_status: SummaryStatus::default(),
         original_filename,
         duration_seconds: None,
+        title: None,
     };
 
     let job_json_path = job_dir.join("job.json");

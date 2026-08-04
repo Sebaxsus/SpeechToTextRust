@@ -69,6 +69,15 @@ pub struct JobMetadata {
     /// esto) o para `job.json` viejos sin este campo.
     #[serde(default)]
     pub duration_seconds: Option<f32>,
+    /// Título representativo elegido por el usuario (campo de texto opcional `title` del
+    /// multipart de `POST /api/upload-audio`), guardado tal cual — nunca se usa para construir
+    /// una ruta de disco, mismo criterio que `original_filename`. `None` si el cliente no mandó
+    /// el campo; el fallback (`title ?? original_filename ?? job_id`) es responsabilidad de quien
+    /// consume `JobSummary` (el cliente web), no se resuelve acá para no perder la distinción
+    /// entre "el usuario no puso título" y "el usuario puso un título vacío". `#[serde(default)]`
+    /// para que un `job.json` viejo siga deserializando.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 impl JobMetadata {

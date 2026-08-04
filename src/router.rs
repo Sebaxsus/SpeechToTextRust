@@ -519,6 +519,66 @@ mod tests {
         assert_eq!(contar_entradas(jobs_dir), jobs_antes);
     }
 
+    /// El campo `title` se manda ANTES del campo de archivo a propósito — el handler no puede
+    /// asumir que el archivo siempre llega primero en el multipart (ver
+    /// `handlers::audio_handler::recibir_y_procesar_audio`). También ejercita el trim de
+    /// espacios en blanco.
+    #[tokio::test]
+    async fn upload_con_title_antes_del_archivo_lo_persiste_en_job_json() {
+        let _guard = crate::audio_pipeline::job::JOBS_DIR_TEST_LOCK.lock().await;
+
+        let jobs_dir = std::path::Path::new("./jobs");
+        let _ = std::fs::create_dir_all(jobs_dir);
+        let jobs_antes = contar_entradas(jobs_dir);
+
+        let app = crear_router(estado_de_prueba());
+        let boundary = "TESTBOUNDARYTITLE";
+
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"title\"\r\n\r\n");
+        body.extend_from_slice("Reunión de planificación  ".as_bytes());
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: audio/wav\r\n\r\n");
+        body.extend_from_slice(b"RIFF\x24\x08\x00\x00WAVEfmt ");
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/upload-audio")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(contar_entradas(jobs_dir), jobs_antes + 1);
+
+        let body_bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let job_id = json["job_id"].as_str().unwrap().to_string();
+
+        let metadata = crate::audio_pipeline::job::load_job(&job_id).expect("job.json ilegible");
+        assert_eq!(metadata.title.as_deref(), Some("Reunión de planificación"));
+
+        let _ = std::fs::remove_dir_all(format!("./jobs/{job_id}"));
+    }
+
     /// Ruta del audio real usado por el test de punta a punta — configurable vía la variable de
     /// entorno `TEST_AUDIO_PATH` (no vía argumento de `cargo test`, que el harness de test
     /// integrado de Rust no expone al binario) para poder probar con cualquier archivo de

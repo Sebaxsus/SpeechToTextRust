@@ -42,7 +42,11 @@ Sube un archivo de audio, crea un job nuevo (`job_id` UUID v4) y dispara el pipe
 ### Request
 
 - `Content-Type: multipart/form-data; boundary=...`
-- Un único campo de archivo (el nombre del campo no se valida — el handler simplemente toma el primer campo del multipart con `multipart.next_field()`). El `filename` que manda el cliente se usa solo para logging, **nunca** para construir una ruta de disco.
+- Un campo de archivo (el nombre del campo no se valida — el handler trata como archivo al primer campo que no se llame `title`). El `filename` que manda el cliente se usa solo para logging/como fallback de título, **nunca** para construir una ruta de disco.
+- Campo de texto **opcional** `title` (agregado 2026-08-04): título representativo elegido por el usuario, para mostrar en el dashboard del cliente en vez de `original_filename`/`job_id`. Puede mandarse antes o después del campo de archivo — el handler no asume un orden fijo entre campos del multipart, los despacha por nombre a medida que llegan. Reglas de validación:
+  - Máximo **200 bytes** UTF-8 (`400 Bad Request` si se supera) — cota deliberadamente chica: es un campo de texto corto, y el límite se aplica leyendo el campo en streaming (no con `campo.text()`), para no bufferear en RAM un `title` arbitrariamente grande dentro del presupuesto general de 1 GiB del body.
+  - Se aplica `trim()`; un valor vacío o solo espacios se trata igual que si el campo no hubiera venido (`title` queda `None` en `job.json`, no `Some("")`).
+  - **Opcional a nivel de API a propósito**: si no se manda (o queda vacío tras el trim), el campo persiste `None` — el fallback de qué mostrar en el dashboard (`title ?? original_filename ?? job_id`) es responsabilidad del cliente, no se resuelve server-side. El cliente web puede exigirlo en su propio formulario (regla de UX), pero la API se mantiene flexible para cualquier otro caller (curl, scripts, tests) que no necesite dar un título.
 - El **formato real se detecta por magic bytes del primer chunk recibido**, no por la extensión del nombre de archivo ni por el `Content-Type` declarado:
   - `ID3` al inicio, o frame sync MPEG (`0xFF` seguido de un byte con los 3 bits altos en `1`) → tratado como `mp3`.
   - Caja ISO-BMFF `ftyp` en el offset 4 (`bytes[4..8] == "ftyp"`) → tratado como `mp4` (cubre también `.m4a`, mismo contenedor).
@@ -73,8 +77,11 @@ Sube un archivo de audio, crea un job nuevo (`job_id` UUID v4) y dispara el pipe
 
 ```bash
 curl -i -X POST http://localhost:3000/api/upload-audio \
-  -F "file=@sample_Media/Muestra2_02min.m4a;type=audio/mp4"
+  -F "file=@sample_Media/Muestra2_02min.m4a;type=audio/mp4" \
+  -F "title=Reunión de planificación — sprint 12"
 ```
+
+`title` es opcional (se puede omitir el `-F "title=..."` sin problema) y puede ir antes o después de `-F "file=..."` en el comando — el orden de los `-F` en curl no importa para el servidor.
 
 ---
 
@@ -129,11 +136,14 @@ Lista todos los jobs — equivalente REST de la tool MCP `list_audios`. Reusa `a
       "transcript_ready_at": null,
       "completed_at": null,
       "summary_status": "NotStarted",
-      "summary": null
+      "summary": null,
+      "original_filename": "reunion_planificacion.m4a",
+      "duration_seconds": 5423.7,
+      "title": "Reunión de planificación — sprint 12"
     }
   ]
   ```
-  A diferencia de `list_audios`/`get_audio_metadata` de MCP, **no** incluye `audio_path`/`transcript_path`/`checkpoint_path` (rutas de disco del servidor) — filtrado desde el día uno para este endpoint. Sin paginación. `processing_started_at`/`transcript_ready_at`/`completed_at` (agregados 2026-07-31, epoch-segundos como string, `null` si esa fase todavía no ocurrió) permiten calcular cuánto tardó cada fase — ver `CLAUDE.local.md`: logger de métricas. `summary_status`/`summary` (agregados 2026-08-01): `summary_status` es uno de `NotStarted | Generating | Ready | Failed`; `summary` trae el texto del resumen solo cuando `summary_status == "Ready"`, `null` en cualquier otro caso — ver `CLAUDE.local.md`: "Resumen por audio".
+  A diferencia de `list_audios`/`get_audio_metadata` de MCP, **no** incluye `audio_path`/`transcript_path`/`checkpoint_path` (rutas de disco del servidor) — filtrado desde el día uno para este endpoint. Sin paginación. `processing_started_at`/`transcript_ready_at`/`completed_at` (agregados 2026-07-31, epoch-segundos como string, `null` si esa fase todavía no ocurrió) permiten calcular cuánto tardó cada fase — ver `CLAUDE.local.md`: logger de métricas. `summary_status`/`summary` (agregados 2026-08-01): `summary_status` es uno de `NotStarted | Generating | Ready | Failed`; `summary` trae el texto del resumen solo cuando `summary_status == "Ready"`, `null` en cualquier otro caso — ver `CLAUDE.local.md`: "Resumen por audio". `original_filename`/`duration_seconds` (agregados 2026-08-04) y `title` (agregado 2026-08-04, ver `POST /api/upload-audio` más abajo): `title` es `null` si el cliente no mandó el campo — el orden de fallback sugerido para el dashboard es `title ?? original_filename ?? job_id`.
 
 ### `GET /api/jobs/{job_id}`
 
@@ -347,7 +357,10 @@ Devuelve el transcript **completo** de un audio (no un resumen ni un retrieval t
   "processing_started_at": "1753700005",
   "transcript_ready_at": null,
   "completed_at": null,
-  "summary_status": "NotStarted"
+  "summary_status": "NotStarted",
+  "original_filename": "reunion_planificacion.m4a",
+  "duration_seconds": 5423.7,
+  "title": "Reunión de planificación — sprint 12"
 }
 ```
 
@@ -355,6 +368,7 @@ Devuelve el transcript **completo** de un audio (no un resumen ni un retrieval t
 - `summary_status` (agregado 2026-08-01) es uno de `"NotStarted" | "Generating" | "Ready" | "Failed"` — a diferencia de los endpoints REST (`JobSummary`), `list_audios`/`get_audio_metadata` de MCP **no** incluyen el texto del resumen en sí (`summary`), solo este bookkeeping — leerlo requeriría un campo adicional a agregar a las tools de MCP si hiciera falta a futuro.
 - `transcript_ready` (agregado 2026-07-30, `#[serde(default)] = false` para compatibilidad con `job.json` viejos sin el campo): `true` en cuanto Fase 2/3 (Whisper + persistencia) termina bien, independiente de si Fase 4 (embeddings) todavía está en curso o falla después.
 - `created_at` es un epoch en segundos, serializado como **string**, no número.
+- `original_filename`/`duration_seconds` (agregados 2026-08-03, PR "job-title-and-duration") y `title` (agregado 2026-08-04) — los tres `null`/ausentes hasta que se pueblen (ver `POST /api/upload-audio` más arriba para `title`; `duration_seconds` se mide con `ffprobe` justo antes de responder `202`). Este bullet corrige un gap real: estos tres campos ya existían/existen en `JobMetadata` pero este schema no los reflejaba desde que se agregaron los dos primeros.
 - Los endpoints REST (`GET /api/jobs`, `GET /api/jobs/{job_id}`) devuelven un `JobSummary` filtrado (sin las 3 rutas de disco) en vez de este schema completo — ver sección propia más arriba. `list_audios`/`get_audio_metadata` de MCP siguen devolviendo el `JobMetadata` completo, con las rutas de disco sin filtrar (ver "Gaps conocidos").
 
 ---
@@ -394,7 +408,7 @@ Extraído de `docs/TODO.md` y verificado contra el código actual — listado ac
 - **`allowed_hosts` de `rmcp` limitado a `localhost`/`127.0.0.1`/`::1`** (default del SDK, protección anti DNS-rebinding): un cliente conectando por la IP de LAN real recibe `403 Forbidden` hasta que se amplíe explícitamente con `.with_allowed_hosts([...])`. Solo afecta a `/mcp` (transporte `rmcp`), no a los endpoints `/api/*` (Axum plano, sin ese chequeo). Relevante ni bien se pruebe el servidor desde otro dispositivo en la misma red.
 - **Bearer token opcional, no obligatorio** — y el servidor ya bindea `0.0.0.0` (ver "Arranque del servidor"). Antes de probar desde otro dispositivo en la LAN, como mínimo setear `MCP_BEARER_TOKEN` (cubre `/mcp` y los endpoints REST protegidos por igual, ver "Autenticación").
 - **"Jobs atascados"**: si el proceso completo del servidor muere a mitad de una transcripción (no un `Err` capturado dentro de Rust, sino el binario cayendo), ningún código marca el job como `Failed` — queda en `Processing` indefinidamente. Detectar esto por `mtime` de `checkpoint.json` está documentado como enfoque en `docs/TODO.md`, sin umbral fijado ni implementado todavía.
-- **`job.json` no tiene ningún campo "amigable" para UI** (nombre de archivo original, título): un selector de audios en el cliente web va a mostrar UUIDs pelados hasta que se agregue.
+- ~~`job.json` no tiene ningún campo "amigable" para UI" (nombre de archivo original, título)~~ — **resuelto**: `original_filename`/`duration_seconds` (2026-08-03) y `title` (2026-08-04, campo opcional de `POST /api/upload-audio`, ver sección propia) ya están disponibles en `JobSummary`/`JobMetadata`. El fallback de qué mostrar (`title ?? original_filename ?? job_id`) sigue siendo responsabilidad del cliente.
 - **Sin `CancellationToken`/graceful shutdown** para las sesiones MCP — matar el proceso no las cierra prolijamente; no bloquea testing manual pero puede dar falsos timeouts en un cliente si el proceso se reinicia con una sesión abierta.
 - ~~`POST /api/upload-audio` no tiene límite de tamaño de archivo explícito~~ — **resuelto 2026-07-31**: límite explícito de 1 GiB, scoped solo a esta ruta (ver sección propia más arriba). Encontrado como bug real, no solo teórico: el default de Axum (2 MiB) truncaba en silencio audios de más de un par de minutos, y el handler trataba el error de lectura resultante como fin del stream normal en vez de reportarlo — el archivo truncado se guardaba con `202 Accepted` como si la subida hubiera sido exitosa, y solo fallaba horas después al decodificarlo en Fase 2 (`Symphonia`/`ffprobe`: "missing moov atom" / "Invalid data found"). Ambos bugs corregidos juntos.
 - **`POST /api/rag/answer` (REST y MCP) sin timeout de request ni streaming**: una generación con el modelo de 7-8B en CPU puede tardar bastante; no hay número medido documentado ni mitigación implementada.

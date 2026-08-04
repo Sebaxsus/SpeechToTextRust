@@ -83,109 +83,149 @@ fn sniff_audio_extension(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// Longitud máxima aceptada para el campo de texto `title` (bytes UTF-8). El resto del multipart
+/// ya tiene un límite de tamaño real (`UPLOAD_BODY_LIMIT_BYTES`, 1 GiB) pensado para el archivo de
+/// audio — sin este tope, ese mismo presupuesto se le podría dar por completo a un campo de texto
+/// en vez de al audio (`campo.text()` lo bufferea entero en memoria, a diferencia del archivo que
+/// siempre se escribe a disco en streaming). 200 bytes alcanza de sobra para un título de reunión
+/// representativo.
+const MAX_TITLE_BYTES: usize = 200;
+
 pub async fn recibir_y_procesar_audio(
     State(state): State<SharedState>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
     tracing::info!("Recibiendo petición en la app: {}", state.nombre_app);
 
-    let Ok(Some(mut campo)) = multipart.next_field().await else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "Error al leer el archivo multipart",
-        )
-            .into_response();
-    };
-
-    // `None` si el cliente no mandó ningún `filename` en el multipart — se persiste tal cual
-    // (ver `JobMetadata::original_filename`), en vez de rellenarlo con un placeholder que
-    // terminaría guardado como si fuera un nombre real.
-    let nombre_archivo = campo.file_name().map(str::to_string);
-
-    // Sniff del primer chunk ANTES de crear cualquier archivo o directorio en disco.
-    let primer_chunk = match campo.chunk().await {
-        Ok(Some(chunk)) => chunk,
-        _ => {
-            return (StatusCode::BAD_REQUEST, "Archivo vacío o inválido").into_response();
-        }
-    };
-
-    let Some(extension) = sniff_audio_extension(&primer_chunk) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "Formato no soportado: solo se aceptan mp3, mp4/m4a y wav",
-        )
-            .into_response();
-    };
-
-    let metadata = match create_job(extension, nombre_archivo.clone()) {
-        Ok(metadata) => metadata,
-        Err(e) => {
-            tracing::error!("Error creando el job: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Error interno del servidor",
-            )
-                .into_response();
-        }
-    };
-
-    let mut archivo_local = match tokio::fs::File::create(&metadata.audio_path).await {
-        Ok(file) => file,
-        Err(e) => {
-            tracing::error!("Error al crear el archivo: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Error interno del servidor",
-            )
-                .into_response();
-        }
-    };
-
-    // Streaming directo al SSD para evitar Thrashing de la RAM.
-    if let Err(e) = archivo_local.write_all(&primer_chunk).await {
-        tracing::error!("Error escribiendo en disco: {}", e);
-        let _ =
-            tokio::fs::remove_dir_all(crate::config::get().paths.jobs_dir.join(&metadata.job_id))
-                .await;
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Error al guardar el archivo",
-        )
-            .into_response();
-    }
+    // El multipart es un stream: no se puede "mirar hacia adelante" para saber si `title` viene
+    // antes o después del campo de archivo sin bufferear el body completo (rompería streaming).
+    // Por eso se itera cada campo según llega y se despacha por nombre — el cliente puede mandar
+    // `title` antes o después del archivo, sin que el servidor le imponga un orden.
+    let mut title: Option<String> = None;
+    let mut nombre_archivo: Option<String> = None;
+    let mut metadata: Option<JobMetadata> = None;
 
     loop {
-        let chunk = match campo.chunk().await {
-            Ok(Some(chunk)) => chunk,
+        let mut campo = match multipart.next_field().await {
+            Ok(Some(campo)) => campo,
             Ok(None) => break,
             Err(e) => {
-                // Un error acá (body sobre el límite de tamaño, conexión cortada a mitad de la
-                // subida) NO es "fin del stream" — el `while let Ok(Some(chunk))` anterior lo
-                // trataba como tal, escribiendo un archivo truncado en disco y respondiendo 202
-                // igual. Ese archivo corrupto recién fallaba horas después, al decodificarlo en
-                // Fase 2, sin ningún indicio de que la subida nunca se completó.
-                tracing::error!("Error leyendo el archivo del multipart: {e}");
-                let _ = tokio::fs::remove_dir_all(
-                    crate::config::get().paths.jobs_dir.join(&metadata.job_id),
-                )
-                .await;
+                tracing::error!("Error leyendo el multipart: {e}");
                 return (
                     StatusCode::BAD_REQUEST,
-                    format!(
-                        "Error leyendo el archivo subido (¿se cortó la conexión, o el archivo \
-                         supera el límite de {} MiB?)",
-                        UPLOAD_BODY_LIMIT_BYTES / 1024 / 1024
-                    ),
+                    "Error al leer el archivo multipart",
                 )
                     .into_response();
             }
         };
 
-        if let Err(e) = archivo_local.write_all(&chunk).await {
+        if campo.name() == Some("title") {
+            // Campo de texto corto, pero leído chunk por chunk (no `campo.text()`) para no
+            // bufferear un campo `title` arbitrariamente grande en memoria antes de poder
+            // rechazarlo — `text()` materializa el campo completo de una sola vez, así que el
+            // corte por MAX_TITLE_BYTES tendría que esperar a tener todo el campo en RAM primero,
+            // justo lo que este límite busca evitar (un `title` de cientos de MB, dentro del
+            // límite general del body de 1 GiB, igual terminaría bufferizado entero).
+            let mut buf: Vec<u8> = Vec::new();
+            let mut demasiado_largo = false;
+            loop {
+                match campo.chunk().await {
+                    Ok(Some(chunk)) => {
+                        buf.extend_from_slice(&chunk);
+                        if buf.len() > MAX_TITLE_BYTES {
+                            demasiado_largo = true;
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!("No se pudo leer el campo 'title' del multipart: {e}");
+                        buf.clear();
+                        break;
+                    }
+                }
+            }
+
+            if demasiado_largo {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("El título no puede superar los {MAX_TITLE_BYTES} bytes"),
+                )
+                    .into_response();
+            }
+
+            if let Ok(texto) = String::from_utf8(buf) {
+                let texto = texto.trim();
+                // Un título en blanco se trata igual que si el campo no hubiera venido — evita
+                // persistir un `title: Some("")` que el cliente tendría que tratar como "sin
+                // título" igual, duplicando la lógica de fallback.
+                if !texto.is_empty() {
+                    title = Some(texto.to_string());
+                }
+            }
+            continue;
+        }
+
+        // Cualquier otro campo se trata como el archivo de audio (mismo criterio previo: el
+        // nombre del campo de archivo no se valida). Solo se procesa el primero — un segundo
+        // campo de archivo, si llegara, se ignora en vez de sobreescribir el job ya creado.
+        if metadata.is_some() {
+            continue;
+        }
+
+        // `None` si el cliente no mandó ningún `filename` en este campo — se persiste tal cual
+        // (ver `JobMetadata::original_filename`), en vez de rellenarlo con un placeholder que
+        // terminaría guardado como si fuera un nombre real.
+        nombre_archivo = campo.file_name().map(str::to_string);
+
+        // Sniff del primer chunk ANTES de crear cualquier archivo o directorio en disco.
+        let primer_chunk = match campo.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            _ => {
+                return (StatusCode::BAD_REQUEST, "Archivo vacío o inválido").into_response();
+            }
+        };
+
+        let Some(extension) = sniff_audio_extension(&primer_chunk) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Formato no soportado: solo se aceptan mp3, mp4/m4a y wav",
+            )
+                .into_response();
+        };
+
+        let job_metadata = match create_job(extension, nombre_archivo.clone()) {
+            Ok(job_metadata) => job_metadata,
+            Err(e) => {
+                tracing::error!("Error creando el job: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Error interno del servidor",
+                )
+                    .into_response();
+            }
+        };
+
+        let mut archivo_local = match tokio::fs::File::create(&job_metadata.audio_path).await {
+            Ok(file) => file,
+            Err(e) => {
+                tracing::error!("Error al crear el archivo: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Error interno del servidor",
+                )
+                    .into_response();
+            }
+        };
+
+        // Streaming directo al SSD para evitar Thrashing de la RAM.
+        if let Err(e) = archivo_local.write_all(&primer_chunk).await {
             tracing::error!("Error escribiendo en disco: {}", e);
             let _ = tokio::fs::remove_dir_all(
-                crate::config::get().paths.jobs_dir.join(&metadata.job_id),
+                crate::config::get()
+                    .paths
+                    .jobs_dir
+                    .join(&job_metadata.job_id),
             )
             .await;
             return (
@@ -194,7 +234,63 @@ pub async fn recibir_y_procesar_audio(
             )
                 .into_response();
         }
+
+        loop {
+            let chunk = match campo.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(e) => {
+                    // Un error acá (body sobre el límite de tamaño, conexión cortada a mitad de
+                    // la subida) NO es "fin del stream" — tratarlo como tal escribiría un archivo
+                    // truncado en disco y respondería 202 igual. Ese archivo corrupto recién
+                    // fallaba horas después, al decodificarlo en Fase 2, sin ningún indicio de
+                    // que la subida nunca se completó.
+                    tracing::error!("Error leyendo el archivo del multipart: {e}");
+                    let _ = tokio::fs::remove_dir_all(
+                        crate::config::get()
+                            .paths
+                            .jobs_dir
+                            .join(&job_metadata.job_id),
+                    )
+                    .await;
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "Error leyendo el archivo subido (¿se cortó la conexión, o el \
+                             archivo supera el límite de {} MiB?)",
+                            UPLOAD_BODY_LIMIT_BYTES / 1024 / 1024
+                        ),
+                    )
+                        .into_response();
+                }
+            };
+
+            if let Err(e) = archivo_local.write_all(&chunk).await {
+                tracing::error!("Error escribiendo en disco: {}", e);
+                let _ = tokio::fs::remove_dir_all(
+                    crate::config::get()
+                        .paths
+                        .jobs_dir
+                        .join(&job_metadata.job_id),
+                )
+                .await;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Error al guardar el archivo",
+                )
+                    .into_response();
+            }
+        }
+
+        metadata = Some(job_metadata);
     }
+
+    let metadata = match metadata {
+        Some(metadata) => metadata,
+        None => {
+            return (StatusCode::BAD_REQUEST, "Archivo vacío o inválido").into_response();
+        }
+    };
 
     let job_id = metadata.job_id.clone();
 
@@ -204,6 +300,12 @@ pub async fn recibir_y_procesar_audio(
         nombre_archivo.as_deref().unwrap_or("(sin nombre)"),
         job_id
     );
+
+    if let Some(title) = title
+        && let Err(e) = update_job_metadata(&job_id, |m| m.title = Some(title))
+    {
+        tracing::error!("No se pudo guardar el título del job '{job_id}': {e}");
+    }
 
     // Corto y sincrónico con la respuesta HTTP a propósito (a diferencia de Whisper/embeddings,
     // que corren en background): el cliente necesita `duration_seconds` disponible desde el
