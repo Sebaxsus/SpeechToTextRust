@@ -2,7 +2,7 @@ name: Claude Code Review
 
 on:
   pull_request:
-    types: [opened, synchronize, ready_for_review, reopened]
+    types: [opened, edited, synchronize, ready_for_review, reopened]
     # Optional: Only run on specific file changes
     # paths:
     #   - "src/**/*.ts"
@@ -19,13 +19,15 @@ on:
 
 jobs:
   claude-review:
-    # Since i want to review the code only when i need. Im adding a condition for a specific mention
-    # Before using code review.
+    # Since i want to review the code only when i need. Im adding a condition for a specific keyword
+    # Before using code review. Deliberately not using "@keyword" notation: GitHub treats "@name" as a
+    # user/team mention and will notify a real account if the name happens to match one (it did, see
+    # the "claudeReview" user) - "[claude-review]" avoids that side effect entirely.
     if: >
-      (github.event_name == 'pull_request' && contains(github.event.pull_request.body, '@claudeReview')) ||
-      (github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '@claudeReview')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claudeReview')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claudeReview'))
+      (github.event_name == 'pull_request' && (contains(github.event.pull_request.title, '[claude-review]') || contains(github.event.pull_request.body, '[claude-review]'))) ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '[claude-review]')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '[claude-review]')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '[claude-review]'))
 
     # Optional: Filter by PR author
     # if: |
