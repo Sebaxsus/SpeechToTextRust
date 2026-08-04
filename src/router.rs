@@ -5,12 +5,35 @@ use crate::state::SharedState;
 use axum::{
     Router,
     extract::{DefaultBodyLimit, Request, State},
-    http::{StatusCode, header::AUTHORIZATION},
+    http::{
+        HeaderValue, Method, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    },
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use std::sync::Arc;
+use tower_http::cors::CorsLayer;
+
+/// `GET /health` — sin autenticación, a propósito: el cliente web lo necesita para distinguir
+/// "backend caído/no alcanzable" de "token inválido" antes incluso de mostrar el login. También
+/// expone si hay una carga pesada (Whisper o una consulta RAG) corriendo ahora mismo
+/// (`heavy_compute_semaphore.available_permits() == 0`), para que el cliente pueda avisar "el
+/// servidor está ocupado, la respuesta puede tardar" antes de mandar una consulta RAG — ver
+/// `docs/know_flaws.md` (punto 3, saber si el semáforo está ocupado).
+#[derive(Debug, serde::Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    heavy_compute_busy: bool,
+}
+
+async fn healthcheck(State(estado): State<SharedState>) -> impl IntoResponse {
+    axum::Json(HealthResponse {
+        status: "ok",
+        heavy_compute_busy: estado.heavy_compute_semaphore.available_permits() == 0,
+    })
+}
 
 /// Límite explícito de tamaño de body para `POST /api/upload-audio` — el default de Axum
 /// (`DefaultBodyLimit`, 2 MiB) truncaba en silencio cualquier audio real de este proyecto (audios
@@ -103,17 +126,41 @@ fn crear_router_protegido(estado: SharedState) -> Router {
         ))
 }
 
+/// Origen permitido para CORS (`CLIENT_ORIGIN`, ver `config.rs`) — parseado una sola vez al armar
+/// el router. Un valor mal formado en `.env` cae al default (`http://localhost:4321`) en vez de
+/// hacer panic al arrancar el servidor; se loguea para que no pase desapercibido.
+fn cors_layer() -> CorsLayer {
+    let origen = &crate::config::get().services.client_origin;
+    let origen = origen.parse::<HeaderValue>().unwrap_or_else(|e| {
+        tracing::warn!(
+            "CLIENT_ORIGIN '{origen}' no es un origen HTTP válido ({e}), usando el default"
+        );
+        HeaderValue::from_static("http://localhost:4321")
+    });
+
+    CorsLayer::new()
+        .allow_origin(origen)
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+}
+
 pub fn crear_router(estado: SharedState) -> Router {
     let upload = Router::new()
         .route("/api/upload-audio", post(recibir_y_procesar_audio))
         .layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT_BYTES))
         .with_state(estado.clone());
 
+    let salud = Router::new()
+        .route("/health", get(healthcheck))
+        .with_state(estado.clone());
+
     Router::new()
         .route("/api/jobs/{job_id}/resume", post(reanudar_job))
         .with_state(estado.clone())
         .merge(upload)
+        .merge(salud)
         .merge(crear_router_protegido(estado))
+        .layer(cors_layer())
 }
 
 #[cfg(test)]
@@ -154,6 +201,66 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `GET /health` no requiere `Authorization` (a diferencia de `GET /api/jobs` y el resto de
+    /// los endpoints protegidos) — el cliente lo necesita para distinguir "backend caído" de
+    /// "token inválido" antes de mostrar el login.
+    #[tokio::test]
+    async fn get_health_devuelve_ok_sin_autenticacion() {
+        let app = crear_router(estado_de_prueba());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["status"], "ok");
+        // El semáforo de prueba tiene 1 permiso y nada lo tomó todavía en este test.
+        assert_eq!(json["heavy_compute_busy"], false);
+    }
+
+    /// Confirma que el `CorsLayer` responde el preflight `OPTIONS` con los headers que el
+    /// cliente web necesita para poder hacer `fetch()` desde otro origen — sin esto, el browser
+    /// bloquea la request antes de que llegue al handler real, aunque el servidor la aceptaría.
+    #[tokio::test]
+    async fn preflight_cors_responde_con_headers_de_acceso() {
+        let app = crear_router(estado_de_prueba());
+        let origen = crate::config::get().services.client_origin.clone();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/jobs")
+                    .header("origin", &origen)
+                    .header("access-control-request-method", "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some(origen.as_str())
+        );
     }
 
     #[tokio::test]
