@@ -54,6 +54,7 @@ pub fn create_job(
         summary_status: SummaryStatus::default(),
         original_filename,
         duration_seconds: None,
+        callback_url: None,
     };
 
     let job_json_path = job_dir.join("job.json");

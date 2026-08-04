@@ -48,6 +48,9 @@ Sube un archivo de audio, crea un job nuevo (`job_id` UUID v4) y dispara el pipe
   - Caja ISO-BMFF `ftyp` en el offset 4 (`bytes[4..8] == "ftyp"`) → tratado como `mp4` (cubre también `.m4a`, mismo contenedor).
   - `RIFF....WAVE` en los primeros 12 bytes → tratado como `wav` (agregado 2026-07-30; Symphonia lo decodifica nativo, sin pasar por el fallback de ffmpeg).
   - Cualquier otra cosa → `400`, sin crear directorio de job ni escribir nada a disco.
+- El nombre de archivo (`filename` del campo) se persiste como `JobMetadata::original_filename` (dato plano, `None` si no se mandó — nunca se usa para construir una ruta de disco) — pensado para que el cliente web muestre un título en vez de un UUID pelado.
+- `duration_seconds` se mide con `ffprobe` sobre el archivo ya escrito a disco, justo antes de responder — `null` si `ffprobe` falla (no bloquea el upload).
+- **Campo opcional `callback_url`** (texto plano, después del campo de archivo en el mismo multipart): si se manda y tiene esquema `http`/`https`, el servidor hace un POST best-effort a esa URL cuando el job termina — ver "Webhook (`callback_url`)" más abajo. Cualquier otro campo con otro nombre se ignora.
 - Límite explícito de **1 GiB** (`router::UPLOAD_BODY_LIMIT_BYTES`, `DefaultBodyLimit::max(...)` aplicado solo a esta ruta, corregido 2026-07-31 — antes corría con el default de Axum, 2 MiB, que truncaba en silencio cualquier audio real de más de un par de minutos). El límite no implica bufferear en RAM: el archivo se sigue escribiendo a disco en streaming, chunk por chunk (`campo.chunk().await` + `write_all` por chunk), nunca se buferea completo en memoria — 1 GiB deja margen cómodo incluso para el caso más pesado hoy soportado (`.wav` PCM sin comprimir, ~550MB para 5h a 16kHz mono).
 
 ### Respuestas
@@ -73,8 +76,21 @@ Sube un archivo de audio, crea un job nuevo (`job_id` UUID v4) y dispara el pipe
 
 ```bash
 curl -i -X POST http://localhost:3000/api/upload-audio \
-  -F "file=@sample_Media/Muestra2_02min.m4a;type=audio/mp4"
+  -F "file=@sample_Media/Muestra2_02min.m4a;type=audio/mp4" \
+  -F "callback_url=http://localhost:4321/api/hooks/job-status"
 ```
+
+---
+
+## Webhook (`callback_url`)
+
+Mecanismo de notificación saliente opcional, pensado para que un cliente web sepa cuándo un job termina sin tener que pollear `GET /api/jobs/{job_id}` en un intervalo fijo. Persistido en `JobMetadata::callback_url` (`Option<String>`, `null` si no se configuró).
+
+- **Cómo se configura**: campo `callback_url` del multipart en `POST /api/upload-audio`, o body JSON `{"callback_url": "..."}` en `POST /api/jobs/{job_id}/resume` (ver ahí). Solo se acepta esquema `http`/`https` — cualquier otro valor se ignora y se loguea (`tracing::warn!`), nunca hace fallar el upload/resume.
+- **Cuándo dispara**: exactamente dos veces por corrida de `lanzar_procesamiento_job` — cuando `job.json.status` pasa a `Completed` o a `Failed` (nunca en transiciones intermedias como `Processing`, ni por chunk). Si el job se reanuda y vuelve a fallar/completar, dispara de nuevo.
+- **Qué manda**: `POST {callback_url}` con body JSON `{"job_id": "<uuid>", "status": "Completed"}` (o `"Failed"`), `Content-Type: application/json`.
+- **Garantías — deliberadamente débiles**: un único intento, timeout de 5s, sin cola de reintentos (mismo criterio ya aceptado en el proyecto para Fase 4/resumen — ver `docs/TODO.md`). Si `callback_url` no responde o responde con error, se loguea (`tracing::warn!`) y no se reintenta. `GET /api/jobs/{job_id}` sigue siendo la fuente de verdad autoritativa — el webhook es un complemento de UX en tiempo real, no un mecanismo de entrega garantizada.
+- **Riesgo de SSRF aceptado, no mitigado con allowlisting de hosts**: `callback_url` es una URL provista por el cliente a la que el servidor hace una petición saliente. Aceptable en este proyecto local-first de un solo usuario, no pensado para exponerse a callers no confiables — mismo criterio de riesgo aceptado que el bearer token opcional (ver "Autenticación" más abajo). Si el servidor alguna vez se expone a callers no confiables, esto necesita revisarse.
 
 ---
 
@@ -86,7 +102,7 @@ Deliberadamente **no** existe como tool MCP (ver `CLAUDE.local.md`: "MCP de solo
 
 ### Request
 
-- Sin body.
+- Body opcional: JSON `{"callback_url": "http://..."}` (ver "Webhook" más arriba). Sin body, se mantiene el `callback_url` que el job ya tenía (si tenía uno) — no lo borra. Un body presente pero mal formado se ignora (se loguea), el resume sigue adelante igual.
 - `job_id` como path param — se valida como UUID bien formado (`Uuid::parse_str`) **antes** de tocar el filesystem. Esto también cierra path traversal: un `job_id` como `../../etc` nunca llega a construirse en una ruta de disco.
 
 ### Respuestas
@@ -129,11 +145,13 @@ Lista todos los jobs — equivalente REST de la tool MCP `list_audios`. Reusa `a
       "transcript_ready_at": null,
       "completed_at": null,
       "summary_status": "NotStarted",
-      "summary": null
+      "summary": null,
+      "original_filename": "Reunion_2026-08-01.m4a",
+      "duration_seconds": 1847.32
     }
   ]
   ```
-  A diferencia de `list_audios`/`get_audio_metadata` de MCP, **no** incluye `audio_path`/`transcript_path`/`checkpoint_path` (rutas de disco del servidor) — filtrado desde el día uno para este endpoint. Sin paginación. `processing_started_at`/`transcript_ready_at`/`completed_at` (agregados 2026-07-31, epoch-segundos como string, `null` si esa fase todavía no ocurrió) permiten calcular cuánto tardó cada fase — ver `CLAUDE.local.md`: logger de métricas. `summary_status`/`summary` (agregados 2026-08-01): `summary_status` es uno de `NotStarted | Generating | Ready | Failed`; `summary` trae el texto del resumen solo cuando `summary_status == "Ready"`, `null` en cualquier otro caso — ver `CLAUDE.local.md`: "Resumen por audio".
+  A diferencia de `list_audios`/`get_audio_metadata` de MCP, **no** incluye `audio_path`/`transcript_path`/`checkpoint_path` (rutas de disco del servidor) — filtrado desde el día uno para este endpoint. Sin paginación. `processing_started_at`/`transcript_ready_at`/`completed_at` (agregados 2026-07-31, epoch-segundos como string, `null` si esa fase todavía no ocurrió) permiten calcular cuánto tardó cada fase — ver `CLAUDE.local.md`: logger de métricas. `summary_status`/`summary` (agregados 2026-08-01): `summary_status` es uno de `NotStarted | Generating | Ready | Failed`; `summary` trae el texto del resumen solo cuando `summary_status == "Ready"`, `null` en cualquier otro caso — ver `CLAUDE.local.md`: "Resumen por audio". `original_filename`/`duration_seconds` (agregados para el cliente web): nombre de archivo original y duración total en segundos, ambos `null` si no se pudieron determinar (sin `filename` en el multipart, o `ffprobe` falló). **No** incluye `callback_url` — es un detalle operativo del webhook, no algo que el cliente necesite leer de vuelta (siempre manda la misma URL fija si quiere notificaciones).
 
 ### `GET /api/jobs/{job_id}`
 
