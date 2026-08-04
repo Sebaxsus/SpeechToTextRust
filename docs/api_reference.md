@@ -11,8 +11,17 @@ Estado actual de la superficie HTTP del servidor (`src/main.rs`, `src/router.rs`
 - `heavy_compute_semaphore` (`Semaphore::new(1)`): como máximo una carga pesada de CPU/modelo a la vez en todo el proceso — compartido entre `POST /api/upload-audio`/`POST /api/jobs/{job_id}/resume` (Whisper) y las tools MCP `search_transcript`/`rag_answer` **y** sus equivalentes REST `POST /api/search`/`POST /api/rag/answer` (Ollama/reranker). Antes se llamaba `transcription_semaphore` y solo gateaba el pipeline de audio; se amplió (2026-07-29) tras detectar que las tools de RAG no tenían ningún gate de concurrencia propio.
 - Si `MCP_BEARER_TOKEN` no está seteado en el entorno, el proceso imprime una advertencia por consola al arrancar (no rechaza arrancar, no rechaza bindear a `0.0.0.0`) — ver "Autenticación" más abajo.
 - Logging (agregado 2026-07-31, ver `CLAUDE.local.md`): `cargo run -- --log` sube el nivel del logger centralizado (`tracing`) a `DEBUG`, mostrando las métricas por chunk del pipeline además de lo que ya se ve por defecto (arranque, warnings, errores). Sin el flag, el nivel es `INFO` — misma visibilidad que antes de migrar a `tracing`.
+- **CORS habilitado** (`tower_http::cors::CorsLayer`, aplicado a todo el router en `router::crear_router`): origen permitido configurable vía `CLIENT_ORIGIN` (default `http://localhost:4321`, el puerto default del modo dev de Astro), métodos `GET`/`POST`, headers `Authorization`/`Content-Type`. Necesario para que el cliente web llame la API directo desde `fetch()` del browser sin proxy intermedio. Un `CLIENT_ORIGIN` mal formado cae al default (se loguea un warning), no hace panic al arrancar.
 
-No hay healthcheck (`GET /health` o similar) implementado todavía.
+## `GET /health`
+
+Healthcheck simple, **sin autenticación** (a propósito: el cliente lo usa para distinguir "backend no alcanzable" de "token inválido" antes de mostrar la pantalla de login).
+
+- **Output**: `200` siempre que el proceso esté vivo.
+  ```json
+  {"status": "ok", "heavy_compute_busy": false}
+  ```
+  `heavy_compute_busy` sale de `heavy_compute_semaphore.available_permits() == 0` — `true` si Whisper o una consulta RAG están corriendo ahora mismo (ver "Arranque del servidor" arriba). Pensado para que el cliente muestre un aviso no bloqueante ("el servidor está ocupado, puede tardar") antes de mandar una consulta pesada, en vez de que la request quede esperando el semáforo sin ninguna explicación visible.
 
 ## Rutas registradas
 
@@ -20,6 +29,7 @@ No hay healthcheck (`GET /health` o similar) implementado todavía.
 
 | Método | Ruta | Handler | Auth | Descripción corta |
 |---|---|---|---|---|
+| `GET` | `/health` | `router::healthcheck` | No | Healthcheck + si hay una carga pesada corriendo ahora mismo. |
 | `POST` | `/api/upload-audio` | `recibir_y_procesar_audio` | No | Sube un audio nuevo, crea un job, dispara el pipeline. |
 | `POST` | `/api/jobs/{job_id}/resume` | `reanudar_job` | No | Reanuda un job existente cortado a mitad de camino. |
 | `GET` | `/api/jobs` | `jobs_handler::listar_jobs_handler` | Sí | Lista todos los jobs (equivalente REST de `list_audios`). |
@@ -390,7 +400,7 @@ Devuelve el transcript **completo** de un audio (no un resumen ni un retrieval t
 Extraído de `docs/TODO.md` y verificado contra el código actual — listado acá porque afecta directamente qué puede hacer un cliente HTTP/MCP hoy:
 
 - **`list_audios`/`get_audio_metadata` de MCP exponen rutas de disco del servidor** (`audio_path`/`transcript_path`/`checkpoint_path`) sin filtrar. No es una fuga de secretos, pero es estructura interna innecesaria para un cliente remoto. Los endpoints REST equivalentes (`GET /api/jobs`, `GET /api/jobs/{job_id}`) ya filtran esos campos desde el día uno — este gap sigue existiendo solo en el lado MCP.
-- **Sin CORS configurado**: ni en `/mcp` ni en los endpoints REST nuevos — si el cliente web futuro los llama directo desde JS del browser (no a través de un backend propio), va a necesitar headers CORS (`Access-Control-Allow-Origin`, exponer `Mcp-Session-Id` para `/mcp`) que hoy no existen en el router.
+- **CORS resuelto para los endpoints `/api/*` y `GET /health`** (`CorsLayer`, ver "Arranque del servidor" arriba) — **sigue sin resolver para `/mcp`**: el cliente web no lo llama directo (usa los wrappers REST), así que no se le agregó CORS ni se expuso `Mcp-Session-Id`; un cliente MCP genérico corriendo en un browser distinto seguiría necesitando esto.
 - **`allowed_hosts` de `rmcp` limitado a `localhost`/`127.0.0.1`/`::1`** (default del SDK, protección anti DNS-rebinding): un cliente conectando por la IP de LAN real recibe `403 Forbidden` hasta que se amplíe explícitamente con `.with_allowed_hosts([...])`. Solo afecta a `/mcp` (transporte `rmcp`), no a los endpoints `/api/*` (Axum plano, sin ese chequeo). Relevante ni bien se pruebe el servidor desde otro dispositivo en la misma red.
 - **Bearer token opcional, no obligatorio** — y el servidor ya bindea `0.0.0.0` (ver "Arranque del servidor"). Antes de probar desde otro dispositivo en la LAN, como mínimo setear `MCP_BEARER_TOKEN` (cubre `/mcp` y los endpoints REST protegidos por igual, ver "Autenticación").
 - **"Jobs atascados"**: si el proceso completo del servidor muere a mitad de una transcripción (no un `Err` capturado dentro de Rust, sino el binario cayendo), ningún código marca el job como `Failed` — queda en `Processing` indefinidamente. Detectar esto por `mtime` de `checkpoint.json` está documentado como enfoque en `docs/TODO.md`, sin umbral fijado ni implementado todavía.
