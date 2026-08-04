@@ -21,7 +21,6 @@ use crate::audio_pipeline::job::{list_jobs, load_job};
 use crate::audio_pipeline::models::{
     ChunkMetrics, JobMetadata, JobStatus, SummaryStatus, TranscriptEntry,
 };
-use crate::rag::LOW_CONFIDENCE_THOLD;
 
 /// Subconjunto público de `JobMetadata` — nunca expone `audio_path`/`transcript_path`/
 /// `checkpoint_path` (rutas de disco del servidor, estructura interna que un cliente remoto no
@@ -142,9 +141,9 @@ pub async fn obtener_job_handler(Path(job_id): Path<String>) -> impl IntoRespons
 }
 
 /// Envuelve `TranscriptEntry` con un campo calculado (nunca persistido) `low_confidence` — el
-/// frontend nunca necesita conocer `LOW_CONFIDENCE_THOLD`, solo lee un booleano ya resuelto por
-/// el servidor. Cambiar el umbral a futuro no requiere reprocesar nada: se recalcula en cada
-/// lectura.
+/// frontend nunca necesita conocer el umbral (`RagConfig::low_confidence_thold`), solo lee un
+/// booleano ya resuelto por el servidor. Cambiar el umbral a futuro no requiere reprocesar nada:
+/// se recalcula en cada lectura.
 #[derive(Debug, Serialize)]
 struct TranscriptEntryView {
     #[serde(flatten)]
@@ -154,7 +153,7 @@ struct TranscriptEntryView {
 
 impl From<TranscriptEntry> for TranscriptEntryView {
     fn from(entry: TranscriptEntry) -> Self {
-        let low_confidence = entry.avg_logprob < LOW_CONFIDENCE_THOLD;
+        let low_confidence = entry.avg_logprob < crate::config::get().rag.low_confidence_thold;
         Self {
             entry,
             low_confidence,
@@ -260,10 +259,6 @@ pub async fn obtener_metricas_handler(Path(job_id): Path<String>) -> impl IntoRe
     Json(MetricsResponse { entries }).into_response()
 }
 
-/// Duración máxima de un segmento pedido — evita una transcodificación arbitrariamente larga
-/// (o abusiva) a través de `GET /api/jobs/{job_id}/audio-segment`.
-const MAX_SEGMENT_SECONDS: f32 = 120.0;
-
 #[derive(Debug, Deserialize)]
 pub struct AudioSegmentParams {
     pub start: f32,
@@ -298,19 +293,20 @@ pub async fn obtener_segmento_audio_handler(
         }
     };
 
+    let max_segment_seconds = crate::config::get().rag.max_segment_seconds;
     let duracion = params.end - params.start;
-    if params.start < 0.0 || duracion <= 0.0 || duracion > MAX_SEGMENT_SECONDS {
+    if params.start < 0.0 || duracion <= 0.0 || duracion > max_segment_seconds {
         return (
             StatusCode::BAD_REQUEST,
             format!(
                 "Rango inválido: start debe ser >= 0, end > start, y la duración no puede \
-                 superar {MAX_SEGMENT_SECONDS} segundos"
+                 superar {max_segment_seconds} segundos"
             ),
         )
             .into_response();
     }
 
-    let mut child = match Command::new("ffmpeg")
+    let mut child = match Command::new(&crate::config::get().paths.ffmpeg_bin)
         .args([
             "-v",
             "error",

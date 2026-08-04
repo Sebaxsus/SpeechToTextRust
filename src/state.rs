@@ -22,6 +22,10 @@ pub struct AppState {
     // shutdown y las sesiones quedan "abiertas" del lado del servidor hasta que el proceso muere
     // (ver docs/TODO.md: "Sin CancellationToken propio ni graceful shutdown").
     pub mcp_cancellation_token: CancellationToken,
+    // `'static` porque vive en el `OnceLock` global de `config::get()` — ver ese módulo para el
+    // porqué de esta forma de acceso (funciones sin `SharedState` a mano usan `config::get()`
+    // directo; con `SharedState` a mano, siempre vía este campo).
+    pub config: &'static crate::config::Config,
 }
 
 pub type SharedState = Arc<AppState>;

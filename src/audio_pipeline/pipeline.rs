@@ -27,7 +27,11 @@ pub fn run_pipeline(metadata: JobMetadata) -> anyhow::Result<()> {
     // también es 0.0, así que `seek_seconds` hace early-return y `resume_from_chunk` se ignora.
     decoder.seek_seconds(cp.processed_seconds, cp.last_chunk + 1)?;
 
-    let mut runner = WhisperRunner::new("models/ggml-small-q5_1.bin")?;
+    let cfg = crate::config::get();
+    let mut runner = WhisperRunner::new(
+        &cfg.paths.whisper_model_path.to_string_lossy(),
+        cfg.whisper.clone(),
+    )?;
 
     loop {
         let t_decode = Instant::now();

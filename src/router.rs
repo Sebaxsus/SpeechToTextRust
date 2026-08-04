@@ -75,7 +75,7 @@ async fn exigir_bearer_token(
 /// closure, independiente del estado propio del router, así que aplicarlo después de fijar
 /// `SharedState` no lo afecta.
 fn crear_router_protegido(estado: SharedState) -> Router {
-    let token = std::env::var("MCP_BEARER_TOKEN").ok().map(Arc::from);
+    let token = crate::config::get().mcp_bearer_token.clone().map(Arc::from);
     let auth_state = McpAuthState { token };
 
     Router::new()
@@ -135,6 +135,7 @@ mod tests {
                 .build()
                 .expect("cliente de Qdrant de prueba"),
             mcp_cancellation_token: tokio_util::sync::CancellationToken::new(),
+            config: crate::config::get(),
         })
     }
 

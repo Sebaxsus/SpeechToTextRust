@@ -1,4 +1,5 @@
 pub mod audio_pipeline;
+pub mod config;
 mod handlers;
 mod mcp;
 mod rag;
@@ -14,6 +15,18 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 #[tokio::main]
 async fn main() {
+    // Carga `.env` de la raíz del repo si existe (siempre `.ok()` — es opcional, ver
+    // `docs/configuracion.md`). Tiene que ser la primerísima línea: cualquier lectura de entorno
+    // posterior (logger, `config::get()`, `MCP_BEARER_TOKEN`) debe ver estas variables ya
+    // pobladas en el entorno real del proceso.
+    dotenvy::dotenv().ok();
+
+    // Fuerza la carga/validación de `Config` temprano — ANTES del logger, porque el logger
+    // necesita `cfg.paths.logs_dir` para saber dónde escribir (ver `config::get`, que por eso usa
+    // `eprintln!` en vez de `tracing::error!` en su camino de error: acá todavía no hay ningún
+    // `Subscriber` instalado).
+    let cfg = config::get();
+
     // Logger centralizado: dos `Layer`s sobre el mismo `Subscriber` global (registry), cada uno
     // con su propio filtro — consola curada, archivo completo. Cualquier módulo llama a
     // `tracing::info!/warn!/error!/debug!` sin pasar ningún logger de un lado a otro.
@@ -34,10 +47,13 @@ async fn main() {
 
     // `tracing_appender::rolling` no crea el directorio destino solo — mismo patrón que
     // `audio_pipeline::job::create_job` para `./jobs/`.
-    if let Err(e) = std::fs::create_dir_all("logs") {
-        eprintln!("No se pudo crear el directorio ./logs: {e}");
+    if let Err(e) = std::fs::create_dir_all(&cfg.paths.logs_dir) {
+        eprintln!(
+            "No se pudo crear el directorio {:?}: {e}",
+            cfg.paths.logs_dir
+        );
     }
-    let file_appender = tracing_appender::rolling::daily("logs", "server.log");
+    let file_appender = tracing_appender::rolling::daily(&cfg.paths.logs_dir, "server.log");
     // `_log_guard` tiene que vivir hasta el final de `main` (por eso el `_` en vez de `_guard`
     // descartable): al dropearse, `non_blocking` deja de flushear su thread de escritura — si se
     // dropeara acá, el archivo se quedaría sin las últimas líneas de cada corrida.
@@ -64,8 +80,8 @@ async fn main() {
 
     // Clientes livianos: no cargan ningún modelo, solo abren la conexión — construirlos acá no
     // viola la regla de "nunca dejar Whisper/Ollama residentes" (ver CLAUDE.local.md).
-    let ollama = ollama_rs::Ollama::default(); // http://127.0.0.1:11434
-    let qdrant = qdrant_client::Qdrant::from_url("http://localhost:6334")
+    let ollama = ollama_rs::Ollama::new(cfg.services.ollama_host.clone(), cfg.services.ollama_port);
+    let qdrant = qdrant_client::Qdrant::from_url(&cfg.services.qdrant_url)
         .build()
         .expect("no se pudo construir el cliente de Qdrant (¿URL inválida?)");
 
@@ -82,20 +98,24 @@ async fn main() {
         ollama,
         qdrant,
         mcp_cancellation_token: mcp_cancellation_token.clone(),
+        config: cfg,
     });
 
     // 2. Creamos el enrutador de Axum
     let app = router::crear_router(estado);
 
-    // 3. Levantamos el servidor en el puerto 3000
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    tracing::info!(target: "lifecycle", "Servidor Axum corriendo en http://localhost:3000");
+    // 3. Levantamos el servidor en la dirección configurada
+    let listener = tokio::net::TcpListener::bind(&cfg.services.bind_addr)
+        .await
+        .unwrap();
+    tracing::info!(target: "lifecycle", "Servidor Axum corriendo en http://{}", cfg.services.bind_addr);
     tracing::info!(
         target: "lifecycle",
-        "Endpoint MCP (Streamable HTTP, Fase 6) en http://localhost:3000/mcp — probar con la \
-         extensión de HTTP requests de VSCode."
+        "Endpoint MCP (Streamable HTTP, Fase 6) en http://{}/mcp — probar con la extensión de \
+         HTTP requests de VSCode.",
+        cfg.services.bind_addr
     );
-    if std::env::var("MCP_BEARER_TOKEN").is_err() {
+    if cfg.mcp_bearer_token.is_none() {
         tracing::warn!(
             "MCP_BEARER_TOKEN no configurado: /mcp queda sin autenticación (ok solo para \
              pruebas locales, ver CLAUDE.local.md: Fase 6)."

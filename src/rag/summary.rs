@@ -20,28 +20,17 @@ use ollama_rs::generation::chat::request::ChatMessageRequest;
 use ollama_rs::generation::parameters::KeepAlive;
 use ollama_rs::models::ModelOptions;
 
-use super::generation::GENERATION_MODEL;
 use crate::audio_pipeline::models::TranscriptEntry;
-
-/// Un lote se cierra al llegar a lo que ocurra primero — cantidad de chunks o caracteres. El
-/// límite de caracteres es una red de seguridad si algunos chunks son inusualmente largos; en la
-/// práctica, para un audio de 5h (~600 chunks de 30s), el límite de chunks es el que normalmente
-/// cierra cada lote, dando ~10-15 lotes.
-const BATCH_MAX_CHUNKS: usize = 50;
-const BATCH_MAX_CHARS: usize = 12_000;
-/// Contexto moderado — muy por debajo del techo de 32768 tokens del modelo, con margen cómodo en
-/// una GPU de 6GB de VRAM (ver CLAUDE.local.md).
-const BATCH_NUM_CTX: u64 = 8192;
-const BATCH_NUM_PREDICT: i32 = 300;
-/// La consolidación final recibe resúmenes de lote (mucho más cortos que el transcript crudo),
-/// así que el mismo `BATCH_NUM_CTX` alcanza de sobra — se le da más presupuesto de salida porque
-/// es el resumen que finalmente se persiste.
-const CONSOLIDATION_NUM_PREDICT: i32 = 500;
+use crate::config::RagConfig;
 
 const NO_SPEECH_MESSAGE: &str = "No se detectó contenido hablado para resumir.";
 
 /// Agrupa las entradas (ya filtradas de texto vacío) en lotes de texto plano concatenado.
-fn build_batches(entries: Vec<TranscriptEntry>) -> Vec<String> {
+/// `batch_max_chunks`/`batch_max_chars` vienen de `RagConfig` (ver `docs/configuracion.md`) — el
+/// límite de caracteres es una red de seguridad si algunos chunks son inusualmente largos; en la
+/// práctica, para un audio de 5h (~600 chunks de 30s), el límite de chunks es el que normalmente
+/// cierra cada lote, dando ~10-15 lotes con los defaults.
+fn build_batches(entries: Vec<TranscriptEntry>, rag: &RagConfig) -> Vec<String> {
     let mut batches = Vec::new();
     let mut current = String::new();
     let mut current_chunks = 0usize;
@@ -52,8 +41,8 @@ fn build_batches(entries: Vec<TranscriptEntry>) -> Vec<String> {
             continue;
         }
 
-        let excede_limite =
-            current_chunks >= BATCH_MAX_CHUNKS || current.len() + text.len() > BATCH_MAX_CHARS;
+        let excede_limite = current_chunks >= rag.batch_max_chunks
+            || current.len() + text.len() > rag.batch_max_chars;
         if excede_limite && !current.is_empty() {
             batches.push(std::mem::take(&mut current));
             current_chunks = 0;
@@ -80,6 +69,7 @@ async fn summarize_batch(
     ollama: &Ollama,
     batch_text: &str,
     is_last_call: bool,
+    rag: &RagConfig,
 ) -> anyhow::Result<String> {
     let prompt = format!(
         "Resumí brevemente, en español, el contenido de este fragmento de una reunión grabada \
@@ -89,13 +79,13 @@ async fn summarize_batch(
     );
 
     let mut request = ChatMessageRequest::new(
-        GENERATION_MODEL.to_string(),
+        rag.generation_model.clone(),
         vec![ChatMessage::user(prompt)],
     )
     .options(
         ModelOptions::default()
-            .num_ctx(BATCH_NUM_CTX)
-            .num_predict(BATCH_NUM_PREDICT),
+            .num_ctx(rag.batch_num_ctx)
+            .num_predict(rag.batch_num_predict),
     );
     if is_last_call {
         request = request.keep_alive(KeepAlive::UnloadOnCompletion);
@@ -115,6 +105,7 @@ async fn summarize_batch(
 async fn consolidate_summaries(
     ollama: &Ollama,
     batch_summaries: &[String],
+    rag: &RagConfig,
 ) -> anyhow::Result<String> {
     let joined = batch_summaries.join("\n\n");
     let prompt = format!(
@@ -124,13 +115,13 @@ async fn consolidate_summaries(
     );
 
     let request = ChatMessageRequest::new(
-        GENERATION_MODEL.to_string(),
+        rag.generation_model.clone(),
         vec![ChatMessage::user(prompt)],
     )
     .options(
         ModelOptions::default()
-            .num_ctx(BATCH_NUM_CTX)
-            .num_predict(CONSOLIDATION_NUM_PREDICT),
+            .num_ctx(rag.batch_num_ctx)
+            .num_predict(rag.consolidation_num_predict),
     )
     .keep_alive(KeepAlive::UnloadOnCompletion);
 
@@ -145,7 +136,11 @@ async fn consolidate_summaries(
 
 /// Genera el resumen de un audio a partir de su `transcript.jsonl` — ver el módulo para el
 /// diseño de map-reduce por lotes. No toca Qdrant/embeddings en absoluto.
-pub async fn generate_summary(ollama: &Ollama, transcript_path: &str) -> anyhow::Result<String> {
+pub async fn generate_summary(
+    ollama: &Ollama,
+    transcript_path: &str,
+    rag: &RagConfig,
+) -> anyhow::Result<String> {
     let file = std::fs::File::open(transcript_path)?;
     let mut entries = Vec::new();
     for line in BufReader::new(file).lines() {
@@ -156,22 +151,22 @@ pub async fn generate_summary(ollama: &Ollama, transcript_path: &str) -> anyhow:
         entries.push(serde_json::from_str::<TranscriptEntry>(&line)?);
     }
 
-    let batches = build_batches(entries);
+    let batches = build_batches(entries, rag);
 
     if batches.is_empty() {
         return Ok(NO_SPEECH_MESSAGE.to_string());
     }
 
     if batches.len() == 1 {
-        return summarize_batch(ollama, &batches[0], true).await;
+        return summarize_batch(ollama, &batches[0], true, rag).await;
     }
 
     let mut batch_summaries = Vec::with_capacity(batches.len());
     for batch in &batches {
-        batch_summaries.push(summarize_batch(ollama, batch, false).await?);
+        batch_summaries.push(summarize_batch(ollama, batch, false, rag).await?);
     }
 
-    consolidate_summaries(ollama, &batch_summaries).await
+    consolidate_summaries(ollama, &batch_summaries, rag).await
 }
 
 #[cfg(test)]
@@ -190,12 +185,13 @@ mod tests {
 
     #[test]
     fn build_batches_saltea_texto_vacio_y_respeta_limite_de_chunks() {
-        let mut entries: Vec<TranscriptEntry> = (0..BATCH_MAX_CHUNKS + 5)
+        let rag = &crate::config::get().rag;
+        let mut entries: Vec<TranscriptEntry> = (0..rag.batch_max_chunks + 5)
             .map(|i| entry(i, "palabra"))
             .collect();
-        entries.push(entry(BATCH_MAX_CHUNKS + 5, "")); // silencio, debe saltearse
+        entries.push(entry(rag.batch_max_chunks + 5, "")); // silencio, debe saltearse
 
-        let batches = build_batches(entries);
+        let batches = build_batches(entries, rag);
 
         assert_eq!(
             batches.len(),
@@ -204,15 +200,15 @@ mod tests {
         );
         assert_eq!(
             batches[0].split_whitespace().count(),
-            BATCH_MAX_CHUNKS,
-            "el primer lote debe tener exactamente BATCH_MAX_CHUNKS palabras (una por chunk)"
+            rag.batch_max_chunks,
+            "el primer lote debe tener exactamente batch_max_chunks palabras (una por chunk)"
         );
     }
 
     #[test]
     fn build_batches_sin_entradas_con_texto_da_lista_vacia() {
         let entries = vec![entry(0, ""), entry(1, "   ")];
-        assert!(build_batches(entries).is_empty());
+        assert!(build_batches(entries, &crate::config::get().rag).is_empty());
     }
 
     #[tokio::test]
@@ -229,9 +225,13 @@ mod tests {
         // `Ollama::default()` no se usa realmente si el transcript está vacío — la función debe
         // devolver el mensaje fijo sin intentar ninguna llamada de red.
         let ollama = Ollama::default();
-        let resultado = generate_summary(&ollama, transcript_path.to_str().unwrap())
-            .await
-            .expect("no debería fallar sobre un transcript vacío");
+        let resultado = generate_summary(
+            &ollama,
+            transcript_path.to_str().unwrap(),
+            &crate::config::get().rag,
+        )
+        .await
+        .expect("no debería fallar sobre un transcript vacío");
 
         assert_eq!(resultado, NO_SPEECH_MESSAGE);
 
@@ -248,20 +248,21 @@ mod tests {
     #[ignore = "requiere Ollama (qcwind/qwen2.5-7b-instruct-Q4_K_M) real"]
     async fn generate_summary_multi_lote_contra_ollama_real() {
         let ollama = Ollama::default();
+        let rag = &crate::config::get().rag;
 
         let dir = std::env::temp_dir().join(format!("summary-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let transcript_path = dir.join("transcript.jsonl");
 
         let mut jsonl = String::new();
-        for i in 0..BATCH_MAX_CHUNKS {
+        for i in 0..rag.batch_max_chunks {
             jsonl.push_str(&format!(
                 "{{\"chunk\":{i},\"start\":{s},\"end\":{e},\"text\":\"Estamos hablando del presupuesto de marketing.\",\"avg_logprob\":-0.2}}\n",
                 s = i as f32 * 30.0,
                 e = (i + 1) as f32 * 30.0,
             ));
         }
-        for i in BATCH_MAX_CHUNKS..BATCH_MAX_CHUNKS + 5 {
+        for i in rag.batch_max_chunks..rag.batch_max_chunks + 5 {
             jsonl.push_str(&format!(
                 "{{\"chunk\":{i},\"start\":{s},\"end\":{e},\"text\":\"Ahora pasamos a coordinar la fecha de la próxima reunión con el arquitecto Julián.\",\"avg_logprob\":-0.2}}\n",
                 s = i as f32 * 30.0,
@@ -270,7 +271,7 @@ mod tests {
         }
         std::fs::write(&transcript_path, &jsonl).unwrap();
 
-        let resumen = generate_summary(&ollama, transcript_path.to_str().unwrap())
+        let resumen = generate_summary(&ollama, transcript_path.to_str().unwrap(), rag)
             .await
             .expect("generate_summary falló contra Ollama real");
 

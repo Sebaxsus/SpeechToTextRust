@@ -28,7 +28,7 @@ static JOB_METADATA_LOCK: Mutex<()> = Mutex::new(());
 /// disk path.
 pub fn create_job(extension: &str) -> anyhow::Result<JobMetadata> {
     let job_id = Uuid::new_v4().to_string();
-    let job_dir = std::path::Path::new("./jobs").join(&job_id);
+    let job_dir = crate::config::get().paths.jobs_dir.join(&job_id);
     fs::create_dir_all(&job_dir)?;
 
     let audio_path = job_dir.join(format!("audio.{extension}"));
@@ -68,7 +68,11 @@ pub fn create_job(extension: &str) -> anyhow::Result<JobMetadata> {
 pub fn load_job(job_id: &str) -> anyhow::Result<JobMetadata> {
     Uuid::parse_str(job_id).context("job_id no es un UUID válido")?;
 
-    let job_json_path = std::path::Path::new("./jobs").join(job_id).join("job.json");
+    let job_json_path = crate::config::get()
+        .paths
+        .jobs_dir
+        .join(job_id)
+        .join("job.json");
     let contents = fs::read_to_string(&job_json_path)
         .with_context(|| format!("no se encontró el job '{job_id}'"))?;
     serde_json::from_str(&contents)
@@ -92,7 +96,11 @@ where
     let mut metadata = load_job(job_id)?;
     mutate(&mut metadata);
 
-    let job_json_path = std::path::Path::new("./jobs").join(job_id).join("job.json");
+    let job_json_path = crate::config::get()
+        .paths
+        .jobs_dir
+        .join(job_id)
+        .join("job.json");
     let job_json = serde_json::to_string_pretty(&metadata)?;
     write_atomic(&job_json_path, &job_json)
 }
@@ -103,7 +111,7 @@ where
 /// (`mcp::listar_jobs`), que delega acá para no duplicar el `read_dir` + `load_job`.
 pub fn list_jobs() -> anyhow::Result<Vec<JobMetadata>> {
     let mut jobs = Vec::new();
-    for entrada in fs::read_dir("./jobs")? {
+    for entrada in fs::read_dir(&crate::config::get().paths.jobs_dir)? {
         let entrada = entrada?;
         if !entrada.file_type()?.is_dir() {
             continue;

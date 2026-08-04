@@ -18,15 +18,9 @@ use symphonia::core::units::Time;
 
 use crate::audio_pipeline::models::AudioChunk;
 
-/// Frecuencia de salida que espera Whisper (PCM mono).
+/// Frecuencia de salida que espera Whisper (PCM mono) — requisito duro del modelo, NUNCA
+/// configurable (a diferencia de `chunk_seconds`/`overlap_seconds`, ver `config::ChunkingConfig`).
 const SAMPLE_RATE_OUT: u32 = 16_000;
-/// 30s @ 16kHz — múltiplo exacto de 160 samples/hop (hop de 10ms de Whisper).
-const CHUNK_SAMPLES: usize = 30 * SAMPLE_RATE_OUT as usize;
-/// 2s de overlap — también múltiplo exacto del hop.
-const OVERLAP_SAMPLES: usize = 2 * SAMPLE_RATE_OUT as usize;
-const ADVANCE_SAMPLES: usize = CHUNK_SAMPLES - OVERLAP_SAMPLES;
-/// Tamaño de bloque de entrada para el resampler (frames de audio mono antes de resamplear).
-const RESAMPLER_CHUNK_SIZE: usize = 1024;
 
 /// De dónde viene el audio decodificado. Symphonia es el camino principal (puro Rust); el
 /// fallback a `ffmpeg` existe porque algunos contenedores mp3/mp4 reales de este proyecto usan
@@ -85,7 +79,7 @@ pub struct StreamingDecoder {
     input_rate: u32,
     resampler: Option<SincFixedIn<f32>>,
     /// Samples mono, sin resamplear, esperando a completar un bloque de tamaño
-    /// `RESAMPLER_CHUNK_SIZE` para alimentar al resampler.
+    /// `resampler_chunk_size` para alimentar al resampler.
     input_accum: Vec<f32>,
     /// Samples mono a 16kHz ya resampleados, listos para recortar en chunks. `VecDeque` para
     /// poder drenar por el frente sin reallocar un `Vec` nuevo por chunk.
@@ -95,6 +89,15 @@ pub struct StreamingDecoder {
     chunk_index: usize,
     /// `true` una vez que la fuente llegó a EOF y ya se hizo el flush final del resampler.
     exhausted: bool,
+    /// Los siguientes 4 campos vienen de `config::ChunkingConfig` (leído una sola vez en `new`,
+    /// nunca releído por chunk) — antes eran consts de módulo (`CHUNK_SAMPLES`/
+    /// `OVERLAP_SAMPLES`/`ADVANCE_SAMPLES`/`RESAMPLER_CHUNK_SIZE`); `Config::load` ya valida que
+    /// `chunk_samples`/`overlap_samples` sean múltiplos del hop de 10ms de Whisper (ver
+    /// "Context Aware Chunking" en CLAUDE.local.md), así que no hace falta revalidar acá.
+    chunk_samples: usize,
+    overlap_samples: usize,
+    advance_samples: usize,
+    resampler_chunk_size: usize,
 }
 
 fn sniff_hint(audio_path: &str) -> Hint {
@@ -116,7 +119,10 @@ fn downmix_interleaved_to_mono(interleaved: &[f32], channels: usize, out: &mut V
     }
 }
 
-fn build_resampler(input_rate: u32) -> anyhow::Result<SincFixedIn<f32>> {
+fn build_resampler(
+    input_rate: u32,
+    resampler_chunk_size: usize,
+) -> anyhow::Result<SincFixedIn<f32>> {
     let params = SincInterpolationParameters {
         sinc_len: 256,
         f_cutoff: 0.95,
@@ -125,7 +131,7 @@ fn build_resampler(input_rate: u32) -> anyhow::Result<SincFixedIn<f32>> {
         window: WindowFunction::BlackmanHarris2,
     };
     let ratio = SAMPLE_RATE_OUT as f64 / input_rate as f64;
-    let resampler = SincFixedIn::<f32>::new(ratio, 1.0, params, RESAMPLER_CHUNK_SIZE, 1)?;
+    let resampler = SincFixedIn::<f32>::new(ratio, 1.0, params, resampler_chunk_size, 1)?;
     Ok(resampler)
 }
 
@@ -208,7 +214,7 @@ fn try_symphonia(audio_path: &str) -> anyhow::Result<SymphoniaSetup> {
 /// Requiere `ffmpeg`/`ffprobe` en el PATH. Ver CLAUDE.local.md: esto es una excepción
 /// deliberada a "sin dependencias externas", necesaria porque Symphonia no decodifica AMR-NB.
 fn build_ffmpeg_source(audio_path: &str, seek_seconds: Option<f32>) -> anyhow::Result<Source> {
-    let probe_output = Command::new("ffprobe")
+    let probe_output = Command::new(&crate::config::get().paths.ffprobe_bin)
         .args([
             "-v",
             "error",
@@ -259,7 +265,7 @@ fn build_ffmpeg_source(audio_path: &str, seek_seconds: Option<f32>) -> anyhow::R
         "-".into(),
     ]);
 
-    let mut child = Command::new("ffmpeg")
+    let mut child = Command::new(&crate::config::get().paths.ffmpeg_bin)
         .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -280,6 +286,12 @@ fn build_ffmpeg_source(audio_path: &str, seek_seconds: Option<f32>) -> anyhow::R
 
 impl StreamingDecoder {
     pub fn new(audio_path: &str) -> anyhow::Result<Self> {
+        let chunking = &crate::config::get().chunking;
+        let chunk_samples = (chunking.chunk_seconds * SAMPLE_RATE_OUT as f32).round() as usize;
+        let overlap_samples = (chunking.overlap_seconds * SAMPLE_RATE_OUT as f32).round() as usize;
+        let advance_samples = chunk_samples - overlap_samples;
+        let resampler_chunk_size = chunking.resampler_chunk_size;
+
         let (source, declared_rate) = match try_symphonia(audio_path) {
             Ok((format, decoder, track_id, declared_rate)) => (
                 Source::Symphonia {
@@ -309,11 +321,15 @@ impl StreamingDecoder {
             source,
             input_rate: declared_rate.unwrap_or(SAMPLE_RATE_OUT),
             resampler: None,
-            input_accum: Vec::with_capacity(RESAMPLER_CHUNK_SIZE * 2),
-            output_buf: VecDeque::with_capacity(CHUNK_SAMPLES * 2),
+            input_accum: Vec::with_capacity(resampler_chunk_size * 2),
+            output_buf: VecDeque::with_capacity(chunk_samples * 2),
             next_start_sample: 0,
             chunk_index: 0,
             exhausted: false,
+            chunk_samples,
+            overlap_samples,
+            advance_samples,
+            resampler_chunk_size,
         })
     }
 
@@ -358,7 +374,7 @@ impl StreamingDecoder {
 
         self.input_accum.clear();
         self.output_buf.clear();
-        self.resampler = Some(build_resampler(self.input_rate)?);
+        self.resampler = Some(build_resampler(self.input_rate, self.resampler_chunk_size)?);
         self.next_start_sample = (seconds as f64 * SAMPLE_RATE_OUT as f64).round() as usize;
         self.chunk_index = resume_from_chunk;
         self.exhausted = false;
@@ -371,8 +387,11 @@ impl StreamingDecoder {
             Some(r) => r,
             None => return Ok(()),
         };
-        while self.input_accum.len() >= RESAMPLER_CHUNK_SIZE {
-            let chunk: Vec<f32> = self.input_accum.drain(..RESAMPLER_CHUNK_SIZE).collect();
+        while self.input_accum.len() >= self.resampler_chunk_size {
+            let chunk: Vec<f32> = self
+                .input_accum
+                .drain(..self.resampler_chunk_size)
+                .collect();
             let resampled = resampler.process(&[chunk], None)?;
             self.output_buf.extend(resampled[0].iter().copied());
         }
@@ -479,7 +498,8 @@ impl StreamingDecoder {
             } => {
                 if self.resampler.is_none() {
                     self.input_rate = rate;
-                    self.resampler = Some(build_resampler(self.input_rate)?);
+                    self.resampler =
+                        Some(build_resampler(self.input_rate, self.resampler_chunk_size)?);
                 }
 
                 downmix_interleaved_to_mono(&interleaved, channels, &mut self.input_accum);
@@ -498,7 +518,7 @@ impl StreamingDecoder {
     }
 
     pub fn next_chunk(&mut self) -> anyhow::Result<Option<AudioChunk>> {
-        while !self.exhausted && self.output_buf.len() < CHUNK_SAMPLES {
+        while !self.exhausted && self.output_buf.len() < self.chunk_samples {
             self.pump()?;
         }
 
@@ -507,14 +527,14 @@ impl StreamingDecoder {
         }
 
         let available = self.output_buf.len();
-        let take = available.min(CHUNK_SAMPLES);
+        let take = available.min(self.chunk_samples);
         let is_first_chunk = self.chunk_index == 0;
         let is_last_chunk = self.exhausted && take == available;
 
         let mut samples: Vec<f32> = self.output_buf.iter().take(take).copied().collect();
         apply_edge_taper(
             &mut samples,
-            OVERLAP_SAMPLES,
+            self.overlap_samples,
             !is_first_chunk,
             !is_last_chunk,
         );
@@ -525,7 +545,7 @@ impl StreamingDecoder {
         let drop_n = if is_last_chunk {
             take
         } else {
-            ADVANCE_SAMPLES.min(take)
+            self.advance_samples.min(take)
         };
         for _ in 0..drop_n {
             self.output_buf.pop_front();

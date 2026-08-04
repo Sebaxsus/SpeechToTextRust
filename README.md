@@ -117,7 +117,7 @@ Verificar: `ffmpeg -version` y `ffprobe -version` deben correr desde cualquier t
 
 ### 3. Modelo de Whisper (GGML)
 
-Descargar `ggml-small-q5_1.bin` (cuantización oficial de whisper.cpp) y colocarlo en `./models/ggml-small-q5_1.bin` desde la raíz del proyecto.
+Descargar `ggml-small-q5_1.bin` (cuantización oficial de whisper.cpp) y colocarlo en `./models/ggml-small-q5_1.bin` desde la raíz del proyecto. Ruta configurable vía `WHISPER_MODEL_PATH` en `.env` si preferís otra ubicación u otro modelo (ver [`docs/configuracion.md`](docs/configuracion.md)).
 
 ### 4. Ollama
 
@@ -144,11 +144,22 @@ docker run -d --name qdrant_local \
 Verificar: `curl http://127.0.0.1:6333/collections` debe responder `200`.
 
 Para revisar/administrar la instancia ya corriendo (dashboard web, ver los vectores guardados,
-entender qué significa cada campo) ver [`docs/qdrant.md`](docs/qdrant.md).
+entender qué significa cada campo) ver [`docs/qdrant.md`](docs/qdrant.md). URL configurable vía
+`QDRANT_URL` en `.env` si corre en otro host/puerto.
 
 ### 6. Reranker (candle + Hugging Face Hub)
 
 No requiere instalación manual: la primera vez que corre código que usa `SearchScope::AllCorpus` (incluyendo el test de integración del reranker), `hf-hub` descarga automáticamente `tokenizer.json`, `config.json` y `model.safetensors` de `BAAI/bge-reranker-v2-m3` (~2.2GB) y los cachea en `~/.cache/huggingface/hub`. Necesita red esa única vez; corridas siguientes son 100% offline.
+
+### 7. Configuración (`.env`, opcional)
+
+Todas las rutas, URLs de servicios, modelos y parámetros de tuning (Whisper, chunking, RAG) se pueden personalizar sin tocar el código:
+
+```bash
+cp .env.example .env
+```
+
+Editá solo lo que necesites — sin `.env`, o con una variable comentada, el comportamiento es idéntico al de un checkout limpio. Ver [`docs/configuracion.md`](docs/configuracion.md) para el detalle completo (qué controla cada variable y en qué archivo se lee).
 
 ## Correr en local
 
@@ -156,7 +167,7 @@ No requiere instalación manual: la primera vez que corre código que usa `Searc
 cargo run
 ```
 
-Levanta el servidor en `http://localhost:3000`. Endpoint principal:
+Levanta el servidor en `http://localhost:3000` por default (dirección/puerto configurables vía `SERVER_BIND_ADDR` en `.env`). Endpoint principal:
 
 ```
 POST /api/upload-audio   (multipart/form-data, campo de archivo mp3/mp4)
@@ -225,5 +236,6 @@ cargo test
 - [`docs/TODO.md`](docs/TODO.md) — trabajo pendiente, priorizado.
 - [`docs/terminology.md`](docs/terminology.md) — glosario de términos (ASR, Nyquist, chunk, tdrz, etc.).
 - [`docs/qdrant.md`](docs/qdrant.md) — cómo revisar/administrar Qdrant a mano (dashboard, comandos `curl`, qué significa cada campo).
+- [`docs/configuracion.md`](docs/configuracion.md) — todas las variables de `.env`: default, dónde se leen en el código, qué controlan.
 
 Las decisiones técnicas detalladas (params exactos de Whisper, reglas de dedupe de tdrz, límites de RAM) viven en `CLAUDE.local.md`, que es un archivo personal no versionado.
