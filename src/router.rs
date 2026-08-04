@@ -14,24 +14,102 @@ use axum::{
     routing::{get, post},
 };
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::cors::CorsLayer;
 
+/// Timeout corto para los chequeos de Qdrant/Ollama dentro de `healthcheck` — `/health` no tiene
+/// autenticación y el cliente lo llama antes incluso de saber si el backend está vivo, así que no
+/// puede quedar colgado esperando a un servicio externo en mal estado. Un puerto simplemente
+/// cerrado (`connection refused`) falla casi al instante; este timeout cubre el caso más raro de
+/// un puerto filtrado/colgado en vez de rechazado. 3s es generoso frente a lo que tarda un
+/// `health_check`/`GET /api/tags` normal en LAN (sub-100ms).
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Un servicio por campo (no `HashMap<String, String>`): son 3 dependencias fijas y conocidas en
+/// tiempo de compilación, y `serde(rename)` deja el nombre exacto de cada clave del JSON explícito
+/// acá en vez de construido a mano en cada call site. Separar "Ollama Embeddings" de "Ollama
+/// Model" en vez de un único "Ollama Server" cuesta lo mismo (una sola llamada a
+/// `list_local_models`, ver `chequear_modelos_ollama`) y detecta un caso real que un estado
+/// genérico no distingue: el servidor Ollama está arriba pero al modelo configurado
+/// (`RAG_EMBEDDING_MODEL`/`RAG_GENERATION_MODEL`) todavía no se le hizo `ollama pull`.
+#[derive(Debug, serde::Serialize)]
+struct ServiceStatus {
+    #[serde(rename = "Qdrant")]
+    qdrant: &'static str,
+    #[serde(rename = "Ollama Embeddings")]
+    ollama_embeddings: &'static str,
+    #[serde(rename = "Ollama Model")]
+    ollama_model: &'static str,
+}
+
 /// `GET /health` — sin autenticación, a propósito: el cliente web lo necesita para distinguir
-/// "backend caído/no alcanzable" de "token inválido" antes incluso de mostrar el login. También
-/// expone si hay una carga pesada (Whisper o una consulta RAG) corriendo ahora mismo
-/// (`heavy_compute_semaphore.available_permits() == 0`), para que el cliente pueda avisar "el
-/// servidor está ocupado, la respuesta puede tardar" antes de mandar una consulta RAG — ver
-/// `docs/know_flaws.md` (punto 3, saber si el semáforo está ocupado).
+/// "backend caído/no alcanzable" de "token inválido" antes incluso de mostrar el login. Expone
+/// tres cosas: si hay una carga pesada (Whisper o una consulta RAG) corriendo ahora mismo
+/// (`heavy_compute_busy`, para que el cliente avise "el servidor está ocupado" antes de mandar una
+/// consulta RAG — ver `docs/know_flaws.md`, punto 3), y la disponibilidad real de Qdrant y de los
+/// dos modelos de Ollama que el pipeline necesita (`services`) — útil porque el proceso Rust puede
+/// estar arriba mientras Qdrant/Ollama no lo están, o mientras el modelo configurado no está
+/// instalado, y hoy eso solo se descubre a mitad de un upload/consulta RAG.
 #[derive(Debug, serde::Serialize)]
 struct HealthResponse {
     status: &'static str,
     heavy_compute_busy: bool,
+    services: ServiceStatus,
 }
 
 async fn healthcheck(State(estado): State<SharedState>) -> impl IntoResponse {
+    let (qdrant_ok, modelos_ollama) =
+        tokio::join!(chequear_qdrant(&estado), chequear_modelos_ollama(&estado));
+
+    let (embeddings_ok, model_ok) = match &modelos_ollama {
+        Some(modelos) => (
+            modelo_instalado(modelos, &estado.config.rag.embedding_model),
+            modelo_instalado(modelos, &estado.config.rag.generation_model),
+        ),
+        None => (false, false),
+    };
+
     axum::Json(HealthResponse {
         status: "ok",
         heavy_compute_busy: estado.heavy_compute_semaphore.available_permits() == 0,
+        services: ServiceStatus {
+            qdrant: if qdrant_ok { "ok" } else { "error" },
+            ollama_embeddings: if embeddings_ok { "ok" } else { "error" },
+            ollama_model: if model_ok { "ok" } else { "error" },
+        },
+    })
+}
+
+async fn chequear_qdrant(estado: &SharedState) -> bool {
+    matches!(
+        tokio::time::timeout(HEALTH_CHECK_TIMEOUT, estado.qdrant.health_check()).await,
+        Ok(Ok(_))
+    )
+}
+
+/// `None` si Ollama no responde o el timeout se cumple (servidor caído/inalcanzable) — en ese caso
+/// tanto "Ollama Embeddings" como "Ollama Model" se reportan `error`, ya que sin lista de modelos
+/// no hay forma de distinguir "no instalado" de "servidor caído" (y ambos ameritan el mismo aviso
+/// al cliente: no se puede confiar en RAG/embeddings ahora mismo).
+async fn chequear_modelos_ollama(
+    estado: &SharedState,
+) -> Option<Vec<ollama_rs::models::LocalModel>> {
+    tokio::time::timeout(HEALTH_CHECK_TIMEOUT, estado.ollama.list_local_models())
+        .await
+        .ok()?
+        .ok()
+}
+
+/// Compara contra el nombre configurado tolerando el tag `:latest` que Ollama agrega en
+/// `list_local_models` aunque `RAG_EMBEDDING_MODEL`/el default no lo incluyan (ej. configurado
+/// `bge-m3`, instalado como `bge-m3:latest`) — sin esto, un healthcheck contra un Ollama real y
+/// bien configurado reportaría "error" en falso para cualquier modelo sin tag explícito.
+fn modelo_instalado(modelos: &[ollama_rs::models::LocalModel], nombre_configurado: &str) -> bool {
+    modelos.iter().any(|m| {
+        m.name == nombre_configurado
+            || m.name
+                .strip_suffix(":latest")
+                .is_some_and(|base| base == nombre_configurado)
     })
 }
 
@@ -230,6 +308,19 @@ mod tests {
         assert_eq!(json["status"], "ok");
         // El semáforo de prueba tiene 1 permiso y nada lo tomó todavía en este test.
         assert_eq!(json["heavy_compute_busy"], false);
+
+        // No se asume si Qdrant/Ollama están corriendo en la máquina donde corre `cargo test` —
+        // solo que el chequeo se resuelve (no queda colgado, ver `HEALTH_CHECK_TIMEOUT`) y produce
+        // uno de los dos valores posibles para cada servicio.
+        for clave in ["Qdrant", "Ollama Embeddings", "Ollama Model"] {
+            let valor = json["services"][clave]
+                .as_str()
+                .unwrap_or_else(|| panic!("services.{clave} no es un string: {json}"));
+            assert!(
+                valor == "ok" || valor == "error",
+                "services.{clave} = '{valor}' inesperado"
+            );
+        }
     }
 
     /// Confirma que el `CorsLayer` responde el preflight `OPTIONS` con los headers que el

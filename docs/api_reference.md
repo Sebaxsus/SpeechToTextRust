@@ -17,11 +17,24 @@ Estado actual de la superficie HTTP del servidor (`src/main.rs`, `src/router.rs`
 
 Healthcheck simple, **sin autenticación** (a propósito: el cliente lo usa para distinguir "backend no alcanzable" de "token inválido" antes de mostrar la pantalla de login).
 
-- **Output**: `200` siempre que el proceso esté vivo.
+- **Output**: `200` siempre que el proceso esté vivo (agregado 2026-08-04: `services`).
   ```json
-  {"status": "ok", "heavy_compute_busy": false}
+  {
+    "status": "ok",
+    "heavy_compute_busy": false,
+    "services": {
+      "Qdrant": "ok",
+      "Ollama Embeddings": "ok",
+      "Ollama Model": "ok"
+    }
+  }
   ```
   `heavy_compute_busy` sale de `heavy_compute_semaphore.available_permits() == 0` — `true` si Whisper o una consulta RAG están corriendo ahora mismo (ver "Arranque del servidor" arriba). Pensado para que el cliente muestre un aviso no bloqueante ("el servidor está ocupado, puede tardar") antes de mandar una consulta pesada, en vez de que la request quede esperando el semáforo sin ninguna explicación visible.
+
+  `services` chequea la disponibilidad real de las dos dependencias externas del pipeline (nunca de Whisper — ese modelo corre dentro del mismo proceso, sin servicio aparte que consultar):
+  - `"Qdrant"`: `qdrant_client::Qdrant::health_check()`.
+  - `"Ollama Embeddings"` / `"Ollama Model"`: una sola llamada a `Ollama::list_local_models()` (`GET /api/tags`), verificando que `RAG_EMBEDDING_MODEL` (`bge-m3`) y `RAG_GENERATION_MODEL` (`qcwind/qwen2.5-7b-instruct-Q4_K_M:latest`, ver `config.rs`) estén efectivamente instalados — no solo que el servidor Ollama responda. Se reportan por separado (no un único `"Ollama Server"`) porque distinguen "Ollama caído" de "Ollama arriba pero al modelo le falta `ollama pull`", con el mismo costo de red (una sola llamada cubre ambos).
+  - Cada valor es `"ok"` o `"error"`. Ambos chequeos corren en paralelo con un timeout de 3s cada uno (`HEALTH_CHECK_TIMEOUT`, `router.rs`) para que `/health` nunca quede colgado esperando a un servicio externo en mal estado — si Ollama no responde a tiempo, `"Ollama Embeddings"` y `"Ollama Model"` quedan ambos en `"error"` (sin lista de modelos no hay forma de distinguirlos, y de cualquier forma ninguno es confiable en ese momento).
 
 ## Rutas registradas
 
@@ -29,7 +42,7 @@ Healthcheck simple, **sin autenticación** (a propósito: el cliente lo usa para
 
 | Método | Ruta | Handler | Auth | Descripción corta |
 |---|---|---|---|---|
-| `GET` | `/health` | `router::healthcheck` | No | Healthcheck + si hay una carga pesada corriendo ahora mismo. |
+| `GET` | `/health` | `router::healthcheck` | No | Healthcheck + carga pesada en curso + disponibilidad de Qdrant/Ollama. |
 | `POST` | `/api/upload-audio` | `recibir_y_procesar_audio` | No | Sube un audio nuevo, crea un job, dispara el pipeline. |
 | `POST` | `/api/jobs/{job_id}/resume` | `reanudar_job` | No | Reanuda un job existente cortado a mitad de camino. |
 | `GET` | `/api/jobs` | `jobs_handler::listar_jobs_handler` | Sí | Lista todos los jobs (equivalente REST de `list_audios`). |
