@@ -54,7 +54,7 @@ pub async fn buscar_handler(
             Json(payload).into_response()
         }
         Err(e) => {
-            eprintln!("Error en /api/search: {e}");
+            tracing::error!("Error en /api/search: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error interno del servidor",
@@ -80,7 +80,7 @@ pub async fn rag_answer_handler(
     match rag_answer(&state.ollama, &state.qdrant, &question, &scope.into()).await {
         Ok(respuesta) => Json(serde_json::json!({ "answer": respuesta })).into_response(),
         Err(e) => {
-            eprintln!("Error en /api/rag/answer: {e}");
+            tracing::error!("Error en /api/rag/answer: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error interno del servidor",

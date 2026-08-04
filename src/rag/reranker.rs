@@ -126,11 +126,11 @@ pub async fn rerank(query: &str, hits: Vec<ChunkHit>) -> Vec<ChunkHit> {
     match tokio::task::spawn_blocking(move || rerank_blocking(&query, hits)).await {
         Ok(Ok(reranked)) => reranked,
         Ok(Err(e)) => {
-            eprintln!("Reranker falló, se mantiene el orden del bi-encoder: {e}");
+            tracing::warn!("Reranker falló, se mantiene el orden del bi-encoder: {e}");
             fallback
         }
         Err(join_err) => {
-            eprintln!(
+            tracing::warn!(
                 "Reranker: spawn_blocking falló ({join_err}), se mantiene el orden del bi-encoder"
             );
             fallback
