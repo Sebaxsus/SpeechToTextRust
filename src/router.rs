@@ -626,6 +626,74 @@ mod tests {
         assert_eq!(contar_entradas(jobs_dir), jobs_antes);
     }
 
+    /// Bug real encontrado y corregido en esta sesión: sin un `drop(campo)` explícito después de
+    /// agotar el campo del archivo, `Multipart::next_field()` fallaba en silencio con "Error
+    /// parsing `multipart/form-data` request" al pedir el siguiente campo — `callback_url` nunca
+    /// se leía ni se persistía, sin que el upload fallara ni diera ningún indicio del problema
+    /// (verificado manualmente contra el servidor real antes del fix: `job.json` quedaba con
+    /// `callback_url: null` pese a mandarlo en el multipart). Este test cubre exactamente ese
+    /// escenario: un multipart con el campo de archivo seguido de `callback_url`, tal como lo
+    /// arma `UploadForm` en el cliente web (ver plan del cliente).
+    #[tokio::test]
+    async fn upload_con_callback_url_lo_persiste_en_job_json() {
+        let _guard = crate::audio_pipeline::job::JOBS_DIR_TEST_LOCK.lock().await;
+
+        let app = crear_router(estado_de_prueba());
+        let boundary = "TESTBOUNDARYCALLBACK";
+        // Header WAV válido (pasa el sniff de magic bytes) pero sin datos reales — no hace falta
+        // que decodifique bien, esto solo prueba el parseo de los campos del multipart, no el
+        // pipeline de Whisper.
+        let wav_minimo: &[u8] = b"RIFF\x24\x08\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\
+             \x80\xBB\x00\x00\x00\xEE\x02\x00\x02\x00\x10\x00data\x00\x08\x00\x00";
+
+        let mut body =
+            construir_cuerpo_multipart(boundary, "callback.wav", "audio/wav", wav_minimo);
+        // `construir_cuerpo_multipart` ya cierra el body con el boundary final — hay que sacarle
+        // ese cierre para poder agregar el campo `callback_url` y recién ahí volver a cerrarlo.
+        let cierre = format!("--{boundary}--\r\n");
+        assert!(body.ends_with(cierre.as_bytes()));
+        body.truncate(body.len() - cierre.len());
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"callback_url\"\r\n\r\n");
+        body.extend_from_slice(b"http://127.0.0.1:9/webhook-test");
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(cierre.as_bytes());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/upload-audio")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let body_bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let job_id = json["job_id"].as_str().unwrap().to_string();
+
+        // `callback_url` se persiste sincrónicamente en el handler, antes de disparar el
+        // procesamiento en background — ya está en disco para cuando llega la respuesta 202, sin
+        // necesidad de esperar ni pollear.
+        let job_json_path = format!("./jobs/{job_id}/job.json");
+        let contenido = std::fs::read_to_string(&job_json_path).expect("job.json debería existir");
+        let job_json: serde_json::Value = serde_json::from_str(&contenido).unwrap();
+        assert_eq!(job_json["callback_url"], "http://127.0.0.1:9/webhook-test");
+
+        let _ = std::fs::remove_dir_all(format!("./jobs/{job_id}"));
+    }
+
     /// Ruta del audio real usado por el test de punta a punta — configurable vía la variable de
     /// entorno `TEST_AUDIO_PATH` (no vía argumento de `cargo test`, que el harness de test
     /// integrado de Rust no expone al binario) para poder probar con cualquier archivo de

@@ -42,6 +42,12 @@ dotenvy = "0.15"
 # resuelta transitivamente (vía axum/rmcp) en Cargo.lock; se fija como dependencia directa con
 # esa misma versión, solo el feature `cors`.
 tower-http = { version = "0.6.11", features = ["cors"] }
+# Cliente HTTP mínimo para el webhook saliente (POST best-effort a callback_url cuando un job
+# termina/falla, ver handlers::audio_handler::notificar_callback_url) — la única llamada HTTP
+# saliente propia del proyecto que no sea a Ollama/Qdrant (que usan sus propios clientes). Solo
+# el feature `json` (serializar {job_id, status}); TLS default para poder aceptar callback_url
+# https, no solo http local.
+reqwest = { version = "0.12", features = ["json"] }
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }

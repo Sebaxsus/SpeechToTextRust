@@ -238,6 +238,7 @@ dependencies = [
  "http-body-util",
  "ollama-rs",
  "qdrant-client",
+ "reqwest",
  "rmcp",
  "rubato",
  "schemars",
