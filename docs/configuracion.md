@@ -46,6 +46,7 @@ raíz del repo y descomentando/editando lo que haga falta. Implementado en `src/
 | `QDRANT_URL` | `http://localhost:6334` | `main.rs` (`Qdrant::from_url`) | URL gRPC de Qdrant. |
 | `SERVER_BIND_ADDR` | `0.0.0.0:3000` | `main.rs` (bind del listener + logs de arranque) | Dirección/puerto donde escucha el servidor Axum. |
 | `MCP_BEARER_TOKEN` | *(sin valor)* | `router.rs` (`crear_router_protegido`) | Token bearer de `/mcp` y los endpoints REST protegidos. Sin esto, esas rutas quedan sin autenticación. |
+| `MCP_ALLOWED_HOSTS` | *(vacío)* | `mcp/mod.rs` (`build_service`) | Hosts (`host` o `host:puerto`, separados por coma) que se suman a los defaults de `allowed_hosts` de `rmcp` (`localhost`/`127.0.0.1`/`::1`, protección anti DNS-rebinding). Sin agregar acá la IP:puerto de LAN real del servidor, un cliente que conecte por esa IP recibe `403` en `/mcp`. |
 
 ## Whisper (ver advertencia en `.env.example` antes de tocar esto)
 
@@ -67,6 +68,7 @@ porqué de cada default (afinados junto con el fix del bug de alucinación "(Por
 | `WHISPER_SPLIT_ON_WORD` | `true` | `split_on_word`. |
 | `WHISPER_N_THREADS` | `8` | `n_threads`. |
 | `WHISPER_INITIAL_PROMPT` | *(frase genérica en español, ver `.env.example`)* | `initial_prompt` — sesgo de idioma/registro. |
+| `WHISPER_GREEDY_BEST_OF` | `5` | `best_of` de `SamplingStrategy::Greedy`. Verificado en `whisper.cpp` (vendorizado en `whisper-rs-sys`) que con `WHISPER_TEMPERATURE=0.0` no afecta el primer intento de ningún chunk — solo se usa en los reintentos a temperatura más alta que whisper.cpp dispara cuando ese primer intento falla `logprob_thold`+`no_speech_thold` (ver `WHISPER_TUNING_LOG.md`, 2026-08-06). |
 
 Todas se leen en `audio_pipeline/whisper_runner.rs` (`WhisperRunner::build_params`).
 
