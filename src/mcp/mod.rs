@@ -233,8 +233,16 @@ impl ServerHandler for RagServer {
 /// son livianos (no cargan modelos), así que esto no viola la regla de "nunca dejar Whisper/Ollama
 /// residentes" (ver CLAUDE.local.md).
 pub fn build_service(state: SharedState) -> StreamableHttpService<RagServer, LocalSessionManager> {
+    // `StreamableHttpServerConfig::default()` ya trae `allowed_hosts` con
+    // `localhost`/`127.0.0.1`/`::1` (protección anti DNS-rebinding del propio SDK) — se extiende
+    // (nunca se reemplaza) con `MCP_ALLOWED_HOSTS` para no perder esos defaults al exponer el
+    // servidor en la IP de LAN (ver CLAUDE.local.md: "Exposición en LAN").
+    let mut allowed_hosts = StreamableHttpServerConfig::default().allowed_hosts;
+    allowed_hosts.extend(state.config.services.mcp_allowed_hosts.iter().cloned());
+
     let config = StreamableHttpServerConfig::default()
-        .with_cancellation_token(state.mcp_cancellation_token.clone());
+        .with_cancellation_token(state.mcp_cancellation_token.clone())
+        .with_allowed_hosts(allowed_hosts);
     StreamableHttpService::new(
         move || Ok(RagServer::new(state.clone())),
         Arc::new(LocalSessionManager::default()),
