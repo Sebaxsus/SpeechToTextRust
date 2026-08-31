@@ -49,7 +49,9 @@ pub fn run_pipeline(metadata: JobMetadata) -> anyhow::Result<()> {
 
     let mut checkpoint = CheckpointManager::new(&metadata.checkpoint_path)?;
 
-    let cp = checkpoint.load()?;
+    // `load_or_recover` tolera un `checkpoint.json` corrupto (ver `docs/TODO.md`, hallazgo
+    // 2026-08-30) reconstruyéndolo desde `transcript.jsonl` en vez de fallar duro acá.
+    let cp = checkpoint.load_or_recover(&metadata.transcript_path)?;
 
     // `last_chunk` es el último chunk que terminó de procesarse antes del corte (o 0 si no hay
     // checkpoint todavía) — el resume retoma en el siguiente. Sin checkpoint, `processed_seconds`
