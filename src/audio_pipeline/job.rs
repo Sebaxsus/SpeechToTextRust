@@ -139,6 +139,43 @@ pub fn list_jobs() -> anyhow::Result<Vec<JobMetadata>> {
     Ok(jobs)
 }
 
+/// Al arrancar el servidor, cualquier job en `Processing` solo puede venir de un proceso anterior
+/// que murió sin actualizar `job.json` (crash, corte de luz, `kill`) — un job legítimamente en
+/// curso no puede sobrevivir a un reinicio del proceso que lo estaba corriendo. Marcarlo `Failed`
+/// cierra el gap real detectado 2026-08-30 (ver `docs/TODO.md`): `POST /api/jobs/{job_id}/resume`
+/// ya funciona sobre cualquier `status`, pero el cliente web solo ofrece el botón de reanudar
+/// cuando `status == Failed` — sin esto, un job atascado en `Processing` queda invisible para
+/// siempre tras un reinicio, aunque el progreso real (`checkpoint.json`/`transcript.jsonl`) siga
+/// intacto y sea perfectamente reanudable. Pensado para llamarse una sola vez en `main()`, antes
+/// de aceptar requests. Devuelve la cantidad de jobs reconciliados para que el caller lo loguee;
+/// un job individual que no se pueda actualizar se loguea acá mismo y no aborta el resto del
+/// barrido.
+pub fn reconciliar_jobs_huerfanos() -> anyhow::Result<usize> {
+    let mut reconciliados = 0;
+    for metadata in list_jobs()? {
+        if !matches!(metadata.status, JobStatus::Processing) {
+            continue;
+        }
+
+        if let Err(e) = update_job_metadata(&metadata.job_id, |m| m.status = JobStatus::Failed) {
+            tracing::error!(
+                "No se pudo reconciliar el job huérfano '{}': {e}",
+                metadata.job_id
+            );
+            continue;
+        }
+
+        tracing::warn!(
+            "Job '{}' quedó en Processing tras un reinicio del servidor — marcado Failed \
+             (progreso preservado en checkpoint.json/transcript.jsonl, reanudable con \
+             POST /api/jobs/{{job_id}}/resume)",
+            metadata.job_id
+        );
+        reconciliados += 1;
+    }
+    Ok(reconciliados)
+}
+
 /// Lock exclusivo para tests que crean/cuentan entradas en el `./jobs` real (compartido con
 /// `router::tests`, ver ahí) — `cargo test` corre los tests de un mismo binario en paralelo
 /// dentro del mismo proceso, así que sin esto un test que cuenta entradas de `./jobs` antes/

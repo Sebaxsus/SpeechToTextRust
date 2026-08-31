@@ -78,6 +78,21 @@ async fn main() {
         .with(file_layer)
         .init();
 
+    // Reconciliación de jobs huérfanos (hallazgo real 2026-08-30, ver docs/TODO.md): un job que
+    // quedó en `Processing` cuando el proceso anterior murió (crash, corte de luz) no puede ser
+    // "todavía en curso" — este es el único proceso que podría estarlo corriendo, y recién está
+    // arrancando. Marcarlo `Failed` acá, antes de aceptar requests, es lo que le permite al
+    // cliente web volver a ofrecer "Resume" sin intervención manual (antes de este fix había que
+    // forzarlo a mano vía `curl`).
+    match audio_pipeline::job::reconciliar_jobs_huerfanos() {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(
+            target: "lifecycle",
+            "Reconciliados {n} job(s) que quedaron en Processing tras el reinicio anterior"
+        ),
+        Err(e) => tracing::error!("No se pudo reconciliar jobs huérfanos al arrancar: {e}"),
+    }
+
     // Clientes livianos: no cargan ningún modelo, solo abren la conexión — construirlos acá no
     // viola la regla de "nunca dejar Whisper/Ollama residentes" (ver CLAUDE.local.md).
     let ollama = ollama_rs::Ollama::new(cfg.services.ollama_host.clone(), cfg.services.ollama_port);
