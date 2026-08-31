@@ -40,25 +40,79 @@ pub struct WhisperRunner {
     /// cachear esto acá evita volver a parsear variables de entorno en el loop caliente del
     /// pipeline (ver `audio_pipeline::pipeline::run_pipeline`).
     tuning: WhisperConfig,
+    /// `cargo run -- --greedy` (ver `WHISPER_TUNING_LOG.md`, 2026-08-07) — mismo patrón que
+    /// `--log` en `main.rs`: flag de CLI leída directamente vía `std::env::args()`, sin pasar por
+    /// `Config`/`.env` (ese módulo está documentado como "cargado desde variables de entorno", no
+    /// de argv). Leída una sola vez por job (acá, no por chunk) y cacheada, igual que `tuning`.
+    ///
+    /// Default `false` = `BeamSearch` (`beam_size=5`): la verificación empírica de larga duración
+    /// del 2026-08-07 (audio real de 49 min, HWiNFO en ambos modos) mostró que el costo de
+    /// CPU/térmico sostenido de BeamSearch es prácticamente ruido de medición frente a Greedy en
+    /// este hardware — el argumento térmico que antes lo mantenía opt-in ya no aplica — y la
+    /// comparación de precisión (`docs/Benchmark.md`) mostró señales a favor de BeamSearch. Con
+    /// `true` (`--greedy`) se usa `Greedy { best_of: tuning.greedy_best_of }`, más rápido pero sin
+    /// esa ganancia de precisión.
+    use_greedy: bool,
 }
 
 impl WhisperRunner {
     pub fn new(model_path: &str, tuning: WhisperConfig) -> anyhow::Result<Self> {
         let ctx = WhisperContext::new_with_params(model_path, WhisperContextParameters::default())?;
         let state = ctx.create_state()?;
-        Ok(Self { state, tuning })
+        let use_greedy = std::env::args().any(|arg| arg == "--greedy");
+        if use_greedy {
+            tracing::info!(
+                target: "lifecycle",
+                "cargo run -- --greedy activo: usando Greedy (best_of={}) en vez de BeamSearch \
+                 (default) — más rápido, pero ver WHISPER_TUNING_LOG.md (2026-08-07) para la \
+                 evidencia de precisión a favor de BeamSearch.",
+                tuning.greedy_best_of
+            );
+        }
+        Ok(Self {
+            state,
+            tuning,
+            use_greedy,
+        })
     }
 
     /// Config de `FullParams` — valores por defecto fijados/documentados en `CLAUDE.local.md`,
     /// overridable vía `.env` (ver `config::WhisperConfig`) — no modificar sin justificar el
     /// impacto en precisión.
-    fn build_params(tuning: &WhisperConfig) -> FullParams<'static, 'static> {
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    ///
+    /// `force_fresh_context`: override puntual de `no_context` para un solo chunk, usado por el
+    /// loop-breaker de `audio_pipeline::pipeline::run_pipeline` (ver `WHISPER_TUNING_LOG.md`,
+    /// hallazgo 2026-08-06) — cuando el pipeline detecta 3+ chunks consecutivos con texto
+    /// idéntico (loop de alucinación tipo "Este es el canal de..."), fuerza `no_context=true` en
+    /// el chunk siguiente para que Whisper no reciba el texto alucinado como "initial prompt" del
+    /// propio `WhisperState` persistente y pueda decodificar ese chunk sin ese sesgo. Normalmente
+    /// es `false` (comportamiento sin cambios: `no_context=false` de siempre).
+    ///
+    /// `use_greedy`: ver doc de `WhisperRunner::use_greedy` — con `false` (default) usa
+    /// `BeamSearch { beam_size: 5, patience: -1.0 }` (defaults documentados por whisper-rs/
+    /// whisper.cpp — `patience` no está implementado aún en whisper.cpp); con `true`
+    /// (`cargo run -- --greedy`) usa `Greedy { best_of: tuning.greedy_best_of }`.
+    fn build_params(
+        tuning: &WhisperConfig,
+        force_fresh_context: bool,
+        use_greedy: bool,
+    ) -> FullParams<'static, 'static> {
+        let sampling_strategy = if use_greedy {
+            SamplingStrategy::Greedy {
+                best_of: tuning.greedy_best_of,
+            }
+        } else {
+            SamplingStrategy::BeamSearch {
+                beam_size: 5,
+                patience: -1.0,
+            }
+        };
+        let mut params = FullParams::new(sampling_strategy);
         params.set_language(Some("es"));
         params.set_translate(false);
         params.set_print_progress(false);
         params.set_print_special(false);
-        params.set_no_context(false);
+        params.set_no_context(force_fresh_context);
         params.set_entropy_thold(tuning.entropy_thold);
         params.set_suppress_blank(tuning.suppress_blank);
         // Suprime un conjunto fijo de tokens de vocabulario (símbolos/puntuación sueltos, entre
@@ -86,11 +140,15 @@ impl WhisperRunner {
     /// `avg_logprob` es la media de `ln(token_probability())` sobre todos los tokens del chunk —
     /// confianza para el payload de Qdrant (ver CLAUDE.local.md, campo `avg_logprob`). Un chunk
     /// sin tokens (silencio puro) devuelve `avg_logprob: 0.0`, `entropy: 0.0`.
+    ///
+    /// `force_fresh_context`: ver doc de `build_params` — pasado tal cual desde el loop-breaker
+    /// de `run_pipeline`, no se cachea acá.
     pub(crate) fn transcribe_chunk(
         &mut self,
         samples: &[f32],
+        force_fresh_context: bool,
     ) -> anyhow::Result<ChunkTranscription> {
-        let params = Self::build_params(&self.tuning);
+        let params = Self::build_params(&self.tuning, force_fresh_context, self.use_greedy);
         self.state.full(params, samples)?;
 
         let mut text = String::new();

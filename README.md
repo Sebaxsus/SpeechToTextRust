@@ -186,6 +186,35 @@ cargo run -- --log    # consola también muestra todo el detalle (DEBUG), útil 
 
 Ver `docs/Arquitechture.md` (sección "Observabilidad y operación") para el diseño del logger.
 
+### Modo de sampling de Whisper
+
+Por defecto Whisper corre con `BeamSearch` (`beam_size=5`) — ver `WHISPER_TUNING_LOG.md`
+(2026-08-07) para la verificación empírica de larga duración (audio real de 49 min, HWiNFO en
+ambos modos) que mostró que su costo de CPU/térmico sostenido es prácticamente ruido de medición
+frente a `Greedy` en este hardware, y que dio señales de mejor precisión (más segmentación, más
+texto capturado, menos frases incoherentes — ver `docs/Benchmark.md`). `cargo run -- --greedy`
+cambia el modo de sampling de **todo el proceso** a `Greedy { best_of: 5 }`, más rápido pero sin
+esa ganancia de precisión:
+
+```bash
+cargo run -- --greedy
+```
+
+### CORS
+
+Por defecto, el servidor solo acepta peticiones CORS del origen configurado en `CLIENT_ORIGIN`
+(default `http://localhost:4321`, ver `docs/configuracion.md`). Para aceptar peticiones desde
+cualquier origen de la red (útil para probar la API desde otro dispositivo/origen sin fijar uno
+solo), usar:
+
+```bash
+cargo run -- --cors-allow-all
+```
+
+Esto **no reemplaza** `MCP_BEARER_TOKEN`: los endpoints protegidos siguen exigiéndolo si está
+configurado — el flag solo relaja el chequeo de origen que hace el browser, no ningún control de
+acceso del servidor. Ver `docs/api_reference.md` ("Arranque del servidor").
+
 ### Cerrar el servidor
 
 `CTRL+C` hace un shutdown prolijo: cierra las sesiones MCP abiertas y deja terminar las requests HTTP en curso antes de salir. Si había una transcripción de Whisper en curso, el chunk que estaba procesándose en ese momento se pierde (no hay forma de cancelar CPU-bound a mitad de camino), pero eso ya está cubierto por diseño — `checkpoint.json` solo avanza tras un chunk completo, así que `POST /api/jobs/{job_id}/resume` retoma exactamente ahí.

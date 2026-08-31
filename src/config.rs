@@ -42,6 +42,14 @@ pub struct ServicesConfig {
     /// desde `fetch()` del browser. Default `http://localhost:4321`, el puerto default del modo
     /// dev de Astro. Ver `router::crear_router`.
     pub client_origin: String,
+    /// Hosts adicionales (`host` o `host:puerto`) a sumar a la lista `allowed_hosts` de
+    /// `StreamableHttpServerConfig` (protección anti DNS-rebinding del propio SDK de `rmcp`, ver
+    /// CLAUDE.local.md: "Exposición en LAN"). Vacío por defecto — sin esta variable, `/mcp` solo
+    /// acepta el `Host` header por el que ya viene preconfigurado `rmcp`
+    /// (`localhost`/`127.0.0.1`/`::1`), y cualquier cliente que conecte por la IP de LAN recibe
+    /// `403`. Formato en `.env`: lista separada por comas, ej.
+    /// `MCP_ALLOWED_HOSTS=192.168.40.6:3000`.
+    pub mcp_allowed_hosts: Vec<String>,
 }
 
 /// Calco 1:1 de los `set_*` de `FullParams` en `audio_pipeline::whisper_runner::build_params` —
@@ -62,6 +70,14 @@ pub struct WhisperConfig {
     pub split_on_word: bool,
     pub n_threads: i32,
     pub initial_prompt: String,
+    /// `best_of` de `SamplingStrategy::Greedy` — ver `WHISPER_TUNING_LOG.md` (hallazgo
+    /// 2026-08-06): con `temperature=0.0` no tiene ningún efecto en el primer intento de cada
+    /// chunk (verificado en `whisper.cpp:7034-7060`, vendorizado en `whisper-rs-sys`), solo
+    /// cuenta en los reintentos a temperatura más alta que whisper.cpp dispara cuando el primer
+    /// intento falla `logprob_thold`+`no_speech_thold` — en los dos jobs reales analizados eso
+    /// fue el 3.9% y 0.7% de los chunks, así que subir este valor del default de `whisper-rs`
+    /// (1) al de `whisper.cpp` (5) mejora esos reintentos con costo de CPU agregado despreciable.
+    pub greedy_best_of: i32,
 }
 
 /// `chunk_seconds`/`overlap_seconds` en segundos (no samples, para que quien edite `.env` no
@@ -178,6 +194,15 @@ impl Config {
             qdrant_url: env_or_default("QDRANT_URL", "http://localhost:6334".to_string())?,
             bind_addr: env_or_default("SERVER_BIND_ADDR", "0.0.0.0:3000".to_string())?,
             client_origin: env_or_default("CLIENT_ORIGIN", "http://localhost:4321".to_string())?,
+            mcp_allowed_hosts: std::env::var("MCP_ALLOWED_HOSTS")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
         };
 
         let whisper = WhisperConfig {
@@ -192,6 +217,7 @@ impl Config {
             token_timestamps: env_or_default("WHISPER_TOKEN_TIMESTAMPS", false)?,
             split_on_word: env_or_default("WHISPER_SPLIT_ON_WORD", true)?,
             n_threads: env_or_default("WHISPER_N_THREADS", 8i32)?,
+            greedy_best_of: env_or_default("WHISPER_GREEDY_BEST_OF", 5i32)?,
             initial_prompt: env_or_default(
                 "WHISPER_INITIAL_PROMPT",
                 "Transcripción de una reunión de trabajo en español, conversación natural."

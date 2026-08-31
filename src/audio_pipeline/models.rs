@@ -147,6 +147,12 @@ pub struct ChunkMetrics {
     /// internamente, recalculada sobre el chunk ya finalizado.
     pub entropy: f32,
     pub segment_count: usize,
+    /// `true` si el loop-breaker de `run_pipeline` detectó 3+ chunks consecutivos con texto
+    /// idéntico y blanqueó el `text` de este chunk en `transcript.jsonl` (ver
+    /// `WHISPER_TUNING_LOG.md`, hallazgo 2026-08-06) — el texto real que dijo Whisper para este
+    /// chunk antes de suprimirlo queda solo en el log (`tracing::warn!`), no en ningún JSONL.
+    #[serde(default)]
+    pub loop_suppressed: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]

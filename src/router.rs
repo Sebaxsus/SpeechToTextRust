@@ -204,10 +204,11 @@ fn crear_router_protegido(estado: SharedState) -> Router {
         ))
 }
 
-/// Origen permitido para CORS (`CLIENT_ORIGIN`, ver `config.rs`) — parseado una sola vez al armar
-/// el router. Un valor mal formado en `.env` cae al default (`http://localhost:4321`) en vez de
-/// hacer panic al arrancar el servidor; se loguea para que no pase desapercibido.
-fn cors_layer() -> CorsLayer {
+/// Origen único permitido para CORS (`CLIENT_ORIGIN`, ver `config.rs`) — comportamiento default,
+/// sin `cargo run -- --cors-allow-all`. Un valor mal formado en `.env` cae al default
+/// (`http://localhost:4321`) en vez de hacer panic al arrancar el servidor; se loguea para que no
+/// pase desapercibido.
+fn cors_layer_origen_unico() -> CorsLayer {
     let origen = &crate::config::get().services.client_origin;
     let origen = origen.parse::<HeaderValue>().unwrap_or_else(|e| {
         tracing::warn!(
@@ -220,6 +221,35 @@ fn cors_layer() -> CorsLayer {
         .allow_origin(origen)
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+}
+
+/// `cargo run -- --cors-allow-all` (ver `docs/api_reference.md`) — acepta peticiones de
+/// cualquier origen (`Access-Control-Allow-Origin: *`), para consultar la API desde cualquier
+/// dispositivo/origen de la LAN sin fijar `CLIENT_ORIGIN` a un valor único. No reemplaza
+/// `MCP_BEARER_TOKEN`: los endpoints protegidos (`/mcp`, `GET /api/jobs*`, `POST /api/search`,
+/// `POST /api/rag/answer`) siguen exigiéndolo si está configurado — este flag solo relaja el
+/// chequeo de origen que hace el *browser*, no ningún control de acceso propio del servidor.
+fn cors_layer_permisivo() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+}
+
+/// Lee el flag de proceso una sola vez al armar el router (mismo patrón que `--log` en
+/// `main.rs`: CLI arg leído directamente vía `std::env::args()`, sin pasar por
+/// `Config`/`.env` — ver doc de `WhisperRunner::use_beam_search`).
+fn cors_layer() -> CorsLayer {
+    if std::env::args().any(|arg| arg == "--cors-allow-all") {
+        tracing::warn!(
+            "cargo run -- --cors-allow-all activo: el servidor acepta peticiones de CUALQUIER \
+             origen (Access-Control-Allow-Origin: *). Esto no reemplaza MCP_BEARER_TOKEN — sin \
+             ese token configurado además, cualquier sitio web podría leer las transcripciones."
+        );
+        cors_layer_permisivo()
+    } else {
+        cors_layer_origen_unico()
+    }
 }
 
 pub fn crear_router(estado: SharedState) -> Router {
@@ -351,6 +381,39 @@ mod tests {
                 .get("access-control-allow-origin")
                 .and_then(|v| v.to_str().ok()),
             Some(origen.as_str())
+        );
+    }
+
+    /// `cors_layer_permisivo()` (usada cuando `cargo run -- --cors-allow-all` está activo) no se
+    /// puede probar a través de `cors_layer()`/`crear_router()` sin reiniciar el proceso de test
+    /// con ese argv — se monta directo en un router mínimo en su lugar, confirmando que responde
+    /// `Access-Control-Allow-Origin: *` sin importar qué origen mande el cliente.
+    #[tokio::test]
+    async fn cors_layer_permisivo_acepta_cualquier_origen() {
+        let app = Router::new()
+            .route("/probe", get(|| async { StatusCode::OK }))
+            .layer(cors_layer_permisivo());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/probe")
+                    .header("origin", "http://cualquier-origen-random.example")
+                    .header("access-control-request-method", "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("*")
         );
     }
 

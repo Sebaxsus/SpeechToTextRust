@@ -6,6 +6,35 @@ use crate::audio_pipeline::jsonl_writer::JsonlWriter;
 use crate::audio_pipeline::models::{ChunkMetrics, JobMetadata, TranscriptEntry};
 use crate::audio_pipeline::whisper_runner::WhisperRunner;
 
+/// Cantidad de chunks consecutivos con texto idéntico que confirman un loop de alucinación (no
+/// habla real distinta) — ver `WHISPER_TUNING_LOG.md`, hallazgo 2026-08-06: en los dos jobs
+/// reales que originaron este fix, los loops encontrados iban de 3 a 325 chunks consecutivos,
+/// nunca menos de 3, así que este umbral detecta todos los casos reales conocidos sin falsos
+/// positivos (3 chunks de 30s con texto *idéntico* ya es prácticamente imposible en habla
+/// distinta).
+const REPETICIONES_PARA_LOOP: u32 = 3;
+
+/// Colapsa espacios (incluye el `\n` que separan segmentos dentro de un mismo chunk) para que la
+/// comparación de repetición no falle por diferencias triviales de espaciado — mismo criterio
+/// que ya se usó para detectar los loops reales en los transcripts de `51b27211-...`/`e2ce31cc-...`.
+fn normalizar_texto(texto: &str) -> String {
+    texto.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Actualiza el contador de repeticiones consecutivas de texto normalizado. Un texto vacío
+/// (silencio real, `no_speech`) nunca cuenta como repetición — ver CLAUDE.local.md: "Condiciones
+/// reales de grabación". Devuelve el nuevo contador: `1` en la primera aparición de un texto no
+/// vacío, incrementado mientras se repita, `0` en cuanto cambia o el chunk queda vacío.
+fn actualizar_contador_repeticion(anterior: &str, actual: &str, contador_anterior: u32) -> u32 {
+    if actual.is_empty() {
+        0
+    } else if actual == anterior {
+        contador_anterior + 1
+    } else {
+        1
+    }
+}
+
 pub fn run_pipeline(metadata: JobMetadata) -> anyhow::Result<()> {
     let mut decoder = StreamingDecoder::new(&metadata.audio_path)?;
 
@@ -33,6 +62,15 @@ pub fn run_pipeline(metadata: JobMetadata) -> anyhow::Result<()> {
         cfg.whisper.clone(),
     )?;
 
+    // Estado del loop-breaker (ver `REPETICIONES_PARA_LOOP`) — vive en el scope de `run_pipeline`,
+    // no persiste entre resumes (un resume construye un `WhisperRunner`/loop nuevo desde cero, así
+    // que en el peor caso tarda hasta `REPETICIONES_PARA_LOOP` chunks en re-detectar un loop que
+    // ya estaba activo al momento del corte — no vale la pena persistirlo en `checkpoint.json`
+    // solo para ese caso borde).
+    let mut ultimo_texto_normalizado = String::new();
+    let mut repeticiones_consecutivas: u32 = 0;
+    let mut forzar_contexto_fresco = false;
+
     loop {
         let t_decode = Instant::now();
         let Some(chunk) = decoder.next_chunk()? else {
@@ -41,17 +79,45 @@ pub fn run_pipeline(metadata: JobMetadata) -> anyhow::Result<()> {
         let decode_ms = t_decode.elapsed().as_millis() as u64;
 
         let t_whisper = Instant::now();
-        let transcription = runner.transcribe_chunk(&chunk.samples)?;
+        let transcription = runner.transcribe_chunk(&chunk.samples, forzar_contexto_fresco)?;
         let whisper_ms = t_whisper.elapsed().as_millis() as u64;
 
         let text_len = transcription.text.chars().count();
+
+        let texto_normalizado = normalizar_texto(&transcription.text);
+        repeticiones_consecutivas = actualizar_contador_repeticion(
+            &ultimo_texto_normalizado,
+            &texto_normalizado,
+            repeticiones_consecutivas,
+        );
+        ultimo_texto_normalizado = texto_normalizado;
+
+        // Ver `WHISPER_TUNING_LOG.md` (hallazgo 2026-08-06): una vez confirmado el loop, se
+        // fuerza `no_context` en el chunk siguiente (rompe la realimentación de contexto que lo
+        // sostiene) y se blanquea el texto de este chunk en adelante mientras persista — mismo
+        // tratamiento que un chunk de silencio real (`run_embedding_phase` ya saltea texto
+        // vacío), en vez de repetir la alucinación cientos de veces en `transcript.jsonl`.
+        let loop_detectado = repeticiones_consecutivas >= REPETICIONES_PARA_LOOP;
+        forzar_contexto_fresco = loop_detectado;
+
+        let texto_final = if loop_detectado {
+            tracing::warn!(
+                chunk = chunk.index,
+                repeticiones = repeticiones_consecutivas,
+                texto_original = %transcription.text,
+                "posible loop de alucinación detectado (texto repetido), se suprime en transcript.jsonl"
+            );
+            String::new()
+        } else {
+            transcription.text
+        };
 
         let t_persist = Instant::now();
         writer.append(TranscriptEntry {
             chunk: chunk.index,
             start: chunk.start_sec,
             end: chunk.end_sec,
-            text: transcription.text,
+            text: texto_final,
             avg_logprob: transcription.avg_logprob,
         })?;
         checkpoint.save(chunk.index, chunk.end_sec)?;
@@ -71,6 +137,7 @@ pub fn run_pipeline(metadata: JobMetadata) -> anyhow::Result<()> {
             no_speech_prob: transcription.no_speech_prob,
             entropy: transcription.entropy,
             segment_count: transcription.segment_count,
+            loop_suppressed: loop_detectado,
         };
 
         // `tracing`'s `Value` solo cubre i64/u64/f64/bool/&str como primitivos (ver
@@ -95,4 +162,60 @@ pub fn run_pipeline(metadata: JobMetadata) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizar_texto_colapsa_espacios_y_saltos_de_linea() {
+        assert_eq!(
+            normalizar_texto("  Este es el canal\nde los estudiantes.  "),
+            "Este es el canal de los estudiantes."
+        );
+    }
+
+    /// Reproduce la secuencia real encontrada en `e2ce31cc-...` (chunks 233-235): el mismo texto
+    /// tres veces seguidas debe llegar a `REPETICIONES_PARA_LOOP` exactamente en la tercera.
+    #[test]
+    fn tres_chunks_identicos_alcanzan_el_umbral_de_loop() {
+        let texto = "Este es el canal de la reunión de los estudiantes.";
+        let mut anterior = String::new();
+        let mut contador = 0;
+
+        contador = actualizar_contador_repeticion(&anterior, texto, contador);
+        assert_eq!(contador, 1);
+        anterior = texto.to_string();
+
+        contador = actualizar_contador_repeticion(&anterior, texto, contador);
+        assert_eq!(contador, 2);
+
+        contador = actualizar_contador_repeticion(&anterior, texto, contador);
+        assert_eq!(contador, 3);
+        assert!(contador >= REPETICIONES_PARA_LOOP);
+    }
+
+    #[test]
+    fn dos_chunks_identicos_no_alcanzan_el_umbral() {
+        let texto = "por favor.";
+        let mut contador = actualizar_contador_repeticion("", texto, 0);
+        contador = actualizar_contador_repeticion(texto, texto, contador);
+        assert_eq!(contador, 2);
+        assert!(contador < REPETICIONES_PARA_LOOP);
+    }
+
+    #[test]
+    fn texto_distinto_resetea_el_contador() {
+        let contador = actualizar_contador_repeticion("¡Suscríbete!", "Gracias por venir.", 5);
+        assert_eq!(contador, 1);
+    }
+
+    /// Un chunk vacío (silencio real) nunca cuenta como repetición, ni siquiera de sí mismo —
+    /// evita que una racha de silencio genuino dispare el loop-breaker.
+    #[test]
+    fn texto_vacio_nunca_cuenta_como_repeticion() {
+        assert_eq!(actualizar_contador_repeticion("", "", 0), 0);
+        assert_eq!(actualizar_contador_repeticion("algo", "", 5), 0);
+    }
 }
